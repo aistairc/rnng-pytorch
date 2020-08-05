@@ -2,7 +2,7 @@
 import numpy as np
 import itertools
 import random
-
+import torch.nn.functional as F
 
 def get_actions(tree, SHIFT = 0, REDUCE = 1, OPEN='(', CLOSE=')'):
   #input tree in bracket form: ((A B) (C D))
@@ -169,3 +169,33 @@ def get_nonbinary_spans(actions, SHIFT = 0, REDUCE = 1):
   assert(len(stack) == 1)
   assert(num_shift == num_reduce + 1)
   return spans, binary_actions, nonbinary_actions
+
+def clean_number(w):
+    new_w = re.sub('[0-9]{1,}([,.]?[0-9]*)*', 'N', w)
+    return new_w
+
+def length_to_mask(length):
+  max_len = length.max()
+  r = length.new_ones(length.size(0), max_len).cumsum(dim=1)
+  return length.unsqueeze(1) >= r
+
+def masked_softmax(xs, mask, dim=-1):
+  while mask.dim() < xs.dim():
+    mask = mask.unsqueeze(1)
+  e = xs.exp()
+  e = e * mask
+  return e / e.sum(dim=dim, keepdim=True)
+
+def pad_items(items, pad_id):
+  """
+  `items`: a list of lists (each row has different number of elements).
+
+  Return:
+    padded_items: a converted items where shorter rows are padded by pad_id.
+    lengths: lengths of rows in original items.
+  """
+  lengths = [len(row) for row in items]
+  max_l = max(lengths)
+  for i in range(len(items)):
+    items[i] = items[i] + ([pad_id] * (max_l - len(items[i])))
+  return items, lengths
