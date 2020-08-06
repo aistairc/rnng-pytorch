@@ -452,7 +452,8 @@ class AttentionComposition(nn.Module):
     rhs = torch.cat([self.nt_emb(nt_id), stack_state], dim=1) # (batch_size, h_dim+w_dim, 1)
     logit = (self.V(children)*rhs.unsqueeze(1)).sum(-1)  # equivalent to bmm(self.V(children), rhs.unsqueeze(-1)).squeeze(-1)
     len_mask = length_to_mask(ch_lengths)
-    attn = masked_softmax(logit, len_mask, dim=1)  # (batch_size, n_children)
+    logit[len_mask != 1] = -float('inf')
+    attn = F.softmax(logit)
     weighted_child = (children*attn.unsqueeze(-1)).sum(1)
 
     nt2 = self.nt_emb2(nt_id)  # (batch_size, w_dim)
@@ -526,7 +527,8 @@ class TopDownRNNG(nn.Module):
     action_contexts = self.stack_to_hidden(action_contexts)
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
-    loss = (a_loss.sum() + w_loss.sum()) / (a_loss.size(0) + w_loss.size(0))
+    # loss = (a_loss.sum() + w_loss.sum()) / (a_loss.size(0) + w_loss.size(0))
+    loss = (a_loss.sum() + w_loss.sum()) / a_loss.size(0)
     return loss, a_loss, w_loss, state
 
   def unroll_state(self, state, word_vecs, actions):
