@@ -61,6 +61,18 @@ def main(args):
 
   all_parses = []
   all_surprisals = []
+
+  def sort_and_print_trees(block_idxs, block_parses, block_surprisals):
+    parse_idx_to_sent_idx = sorted(list(enumerate(block_idxs)), key=lambda x:x[1])
+    orig_order_parses = [block_parses[parse_idx] for (parse_idx, _) in parse_idx_to_sent_idx]
+    orig_order_surps = [block_surprisals[parse_idx] for (parse_idx, _) in parse_idx_to_sent_idx]
+
+    all_parses.extend(orig_order_parses)
+    all_surprisals.extend(orig_order_surps)
+
+    for parse in orig_order_parses:
+      print(parse)
+
   with torch.no_grad():
 
     block_idxs = []
@@ -86,19 +98,13 @@ def main(args):
 
       if cur_block_size >= args.block_size:
         assert cur_block_size == args.block_size
-        parse_idx_to_sent_idx = sorted(list(enumerate(block_idxs)), key=lambda x:x[1])
-        orig_order_parses = [block_parses[parse_idx] for (parse_idx, _) in parse_idx_to_sent_idx]
-        orig_order_surps = [block_surprisals[parse_idx] for (parse_idx, _) in parse_idx_to_sent_idx]
-
-        all_parses.extend(orig_order_parses)
-        all_surprisals.extend(orig_order_surps)
-
-        for parse in orig_order_parses:
-          print(parse)
+        sort_and_print_trees(block_idxs, block_parses, block_surprisals)
         block_idxs = []
         block_parses = []
         block_surprisals = []
         cur_block_size = 0
+
+  sort_and_print_trees(block_idxs, block_parses, block_surprisals)
 
   with open(args.lm_output_file, 'wt') as o:
     for sent_i, (sent, surp) in enumerate(zip(dataset.sents, all_surprisals)):
