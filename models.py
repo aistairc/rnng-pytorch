@@ -528,7 +528,8 @@ class TopDownRNNG(nn.Module):
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
     # loss = (a_loss.sum() + w_loss.sum()) / (a_loss.size(0) + w_loss.size(0))
-    loss = (a_loss.sum() + w_loss.sum()) / a_loss.size(0)
+    # loss = (a_loss.sum() + w_loss.sum()) / a_loss.size(0)
+    loss = (a_loss.sum() + w_loss.sum())
     return loss, a_loss, w_loss, state
 
   def unroll_state(self, state, word_vecs, actions):
