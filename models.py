@@ -491,16 +491,18 @@ class TopDownRNNG(nn.Module):
       nn.Embedding(vocab, w_dim, padding_idx=padding_idx), self.dropout)
     self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), w_dim), self.dropout)
     self.stack_rnn = SeqLSTM(w_dim, h_dim, num_layers=num_layers, dropout=dropout)
-    self.vocab_mlp = nn.Sequential(self.dropout, nn.Linear(h_dim, vocab))
+    self.stack_to_hidden = nn.Sequential(self.dropout, nn.Linear(h_dim, h_dim), nn.ReLU())
+    self.vocab_mlp = nn.Linear(h_dim, vocab)
     self.num_layers = num_layers
     self.num_actions = action_dict.num_actions()  # num_labels + 2
-    self.action_mlp = nn.Sequential(self.dropout, nn.Linear(h_dim, self.num_actions))
+    self.action_mlp = nn.Linear(h_dim, self.num_actions)
     self.w_dim = w_dim
     self.h_dim = h_dim
     if w_dim == h_dim:
-      self.vocab_mlp[-1].weight = self.emb[0].weight
+      self.vocab_mlp.weight = self.emb[0].weight
 
-    self.composition = (AttentionComposition(w_dim) if attention_composition else
+    self.composition = (AttentionComposition(w_dim, h_dim, self.action_dict.num_nts())
+                        if attention_composition else
                         LSTMComposition(w_dim, dropout))
     self.max_open_nts = max_open_nts
     self.max_cons_nts = max_cons_nts
@@ -521,6 +523,7 @@ class TopDownRNNG(nn.Module):
     assert step == actions.size(1)
 
     action_contexts = state.action_contexts()
+    action_contexts = self.stack_to_hidden(action_contexts)
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
     loss = (a_loss.sum() + w_loss.sum()) / (a_loss.size(0) + w_loss.size(0))
@@ -540,6 +543,7 @@ class TopDownRNNG(nn.Module):
     if len(reduce_batch) > 0:
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(state, reduce_batch)
       reduce_context = state.stack_top_h(reduce_batch)
+      reduce_context = self.stack_to_hidden(reduce_context)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
     else:
       new_child = None
@@ -718,6 +722,7 @@ class TopDownRNNG(nn.Module):
     new_x: tensor of size (batch)
     """
     hiddens = self.stack_top_h(states)  # (total beam size, h_dim)
+    hiddens = self.stack_to_hidden(hiddens)  # (total beam size, h_dim)
 
     action_logit = self.action_mlp(hiddens)
     action_logit[action_mask != 1] = -float('inf')
@@ -852,6 +857,7 @@ class TopDownRNNG(nn.Module):
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce_beam(
         reduce_states)
       reduce_context = self._collect_stack_top_h_beam(reduce_states)
+      reduce_context = self.stack_to_hidden(reduce_context)
       # state.stack_top_h(reduce_batch)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
     else:
