@@ -741,7 +741,8 @@ class TopDownRNNG(nn.Module):
     return log_probs
 
   def valid_action_mask(self, items, sent_len):
-    mask = items[0].state.stack[0][0][0].new_ones(len(items), self.num_actions, dtype=torch.uint8)
+    #mask = items[0].state.stack[0][0][0].new_ones(len(items), self.num_actions, dtype=torch.uint8)
+    mask = torch.ones((len(items), self.num_actions), dtype=torch.uint8)
     mask[:, self.action_dict.padding_idx] = 0
     for b, item in enumerate(items):
       state = item.state
@@ -764,6 +765,7 @@ class TopDownRNNG(nn.Module):
           self.action_dict.is_nt(prev_action) or # cannot reduce immediately after nt
           len(state.stack) < 3):
         self.action_dict.mask_reduce(mask, b)
+    mask = mask.to(items[0].state.stack[0][0][0].device)
 
     return mask
 
