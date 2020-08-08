@@ -768,14 +768,6 @@ class TopDownRNNG(nn.Module):
 
     return mask
 
-  def accumulate_scores(self, action_to_log_prob, beam):
-    for batch, items in enumerate(beam):
-      scores = action_to_log_prob[batch]
-      assert len(items) == len(scores)
-      item_scores = np.expand_dims(np.array([item.score for item in items]), 1)
-      total_scores.append(scores + item_scores)
-    return total_scores
-
   def stack_top_h(self, states):
     return torch.stack([state.stack[-1][-1][0] for state in states], dim=0)
 
@@ -1178,26 +1170,3 @@ class BeamItem:
     state = self.state.copy()
     path = self.action_path.add_action(action, score)
     return BeamItem(state, path)
-
-# class SuccessorItem:
-#   def __init__(self, prev_beam_item, action, score):
-#     self.prev_beam_item = prev_beam_item
-#     self.action = action
-#     self.score = score
-
-#   def __eq__(self, other):
-#     return (self.prev_beam_item is other.prev_beam_item and
-#             self.action == other.action and
-#             self.score == other.score)
-
-#   def __hash__(self):
-#     return hash((id(self.prev_beam_item), self.action, self.score))
-
-#   def to_incomplete_beam_item(self):
-#     """
-#     This BeamItem is incomplete, as its state is just copy of the previous state.
-#     Proper action and stack update should be performed.
-#     """
-#     state = self.prev_beam_item.state.copy()
-#     path = self.prev_beam_item.action_path.add_action(self.action, self.score)
-#     return BeamItem(state, path)
