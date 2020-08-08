@@ -42,6 +42,9 @@ class TopDownActionDict:
     def nt_id(self, a):
         return a - 3
 
+    def nt_begin_id(self):
+        return 3
+
     def mk_action_tensor(self, action_strs, device='cpu'):
         action_ids = [[self.a2i[a] for a in action_str] for action_str in action_strs]
         max_len = max([len(ids) for ids in action_ids])

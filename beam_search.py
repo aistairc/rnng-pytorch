@@ -55,7 +55,6 @@ def main(args):
   cuda.set_device(args.gpu)
   model.cuda()
   model.eval()
-  num_sents = 0
 
   cur_block_size = 0
 

@@ -648,18 +648,18 @@ class TopDownRNNG(nn.Module):
 
     for pointer in range(x.size(1) + 1):
       forced_completions = [0 for _ in range(x.size(0))]
+      bucket_i = 0
       while not all(len(batch_beam) == 0 for batch_beam in beam):
-        successors, forced_completion_successors = self.get_successors(
+        successors, added_forced_completions = self.get_successors(
           x, pointer, beam, beam_size, shift_size)
-
-        new_beam, added_forced_completions = self.reset_beam(
-          successors, forced_completion_successors, shift_size > 0)
+        new_beam = [[beam[batch_i][b].next_incomplete_item(a, s) for (b, a, s) in batch_succs]
+                    for batch_i, batch_succs in enumerate(successors)]
         for i, c in enumerate(added_forced_completions):
           forced_completions[i] += c
 
         all_items, batch_idx = self._flatten_items(new_beam)
         all_states = [item.state for item in all_items]
-        self.update_stack_rnn(all_items, all_states, word_vecs, batch_idx)
+        self.update_stack_rnn(all_items, all_states, word_vecs, batch_idx, pointer)
 
         beam_lengths = [len(batch_beam) for batch_beam in new_beam]
         self.update_beam_and_word_completed(
@@ -672,6 +672,7 @@ class TopDownRNNG(nn.Module):
           # `len(word_completed[b]) - forced_completions[b] >= word_beam_size`?
           if len(word_completed[b]) - forced_completions[b] >= beam_size:
             beam[b] = []
+        bucket_i += 1
 
       for b in range(len(beam)):
         word_completed[b].sort(key=lambda x: x.score, reverse=True)
@@ -709,15 +710,13 @@ class TopDownRNNG(nn.Module):
 
     action_mask = self.valid_action_mask(all_items, x.size(1))  # (total beam size, n_actions)
     log_probs = self.action_log_probs(states, action_mask, next_x)  # tensor of size (total beam, n_actions)
+    log_probs += log_probs.new_tensor([item.score for item in all_items]).unsqueeze(1)
 
     log_probs = self._deflatten_items(log_probs, beam_lengths)
-    log_probs = [row.detach().cpu().numpy() for row in log_probs]
 
-    total_scores = self.accumulate_scores(log_probs, beam)  # (batch) -> ((beam, action) -> score)
-    successors, forced_completion_successors = self.scores_to_successors(
-      x, pointer, beam, total_scores, beam_size, shift_size)
-
-    return successors, forced_completion_successors
+    successors, forced_completions = self.scores_to_successors(
+      x, pointer, beam, log_probs, beam_size, shift_size)
+    return successors, forced_completions
 
   def action_log_probs(self, states, action_mask, next_x = None):
     """
@@ -748,7 +747,7 @@ class TopDownRNNG(nn.Module):
       state = item.state
       prev_action = item.action
       if state.pointer == sent_len and state.nopen_parens == 0:  # finished
-        mask[b,:] = 0
+        mask[b, :] = 0
         continue
       if state.nopen_parens == 0:  # only nt
         assert state.pointer == 0 and len(state.stack) == 1
@@ -758,7 +757,7 @@ class TopDownRNNG(nn.Module):
         self.action_dict.mask_nt(mask, b)
         self.action_dict.mask_shift(mask, b)
       if (state.nopen_parens > self.max_open_nts or
-            state.ncons_nts >= self.max_cons_nts):  # no more open
+          state.ncons_nts >= self.max_cons_nts):  # no more open
         self.action_dict.mask_nt(mask, b)
 
       if ((state.nopen_parens == 1 and state.pointer < sent_len) or # cannot reduce the unique open element at intermediate steps.
@@ -770,8 +769,6 @@ class TopDownRNNG(nn.Module):
     return mask
 
   def accumulate_scores(self, action_to_log_prob, beam):
-    assert len(action_to_log_prob) == len(beam)  # batch size
-    total_scores = []
     for batch, items in enumerate(beam):
       scores = action_to_log_prob[batch]
       assert len(items) == len(scores)
@@ -783,53 +780,61 @@ class TopDownRNNG(nn.Module):
     return torch.stack([state.stack[-1][-1][0] for state in states], dim=0)
 
   def scores_to_successors(self, x, pointer, beam, total_scores, beam_size, shift_size):
+    # If total_scores is a list of two dimensional tensor.
     successors = [[] for _ in range(len(total_scores))]
-    forced_completion_successors = [[] for _ in range(len(total_scores))]
-
+    forced_completions = [0 for _ in range(len(total_scores))]
     for batch, batch_total_scores in enumerate(total_scores):
-      for beam_i, scores in enumerate(batch_total_scores):
-        successors[batch] += [(beam_i, a_i, s) for a_i, s in enumerate(scores)]
-      if pointer == x.size(1):  # reduce would finish.
-        reduce_i = self.action_dict.a2i['REDUCE']
-        reduce_succs = [(beam_i, reduce_i, scores[reduce_i]) for beam_i, scores in
-                        enumerate(batch_total_scores) if
-                        beam[batch][beam_i].state.can_finish_by_reduce()]
-        forced_completion_successors[batch] += reduce_succs
-      else:  # save all shift
-        shift_i = self.action_dict.a2i['SHIFT']
-        shift_succs = [(beam_i, shift_i, scores[shift_i]) for beam_i, scores in
-                       enumerate(batch_total_scores)]
-        forced_completion_successors[batch] += shift_succs
+      if batch_total_scores.size(0) == 0:
+        continue  # this batch is finished.
+      num_beams, num_actions = batch_total_scores.size()
+      scores = batch_total_scores.view(-1)
+      sorted_scores, sort_idx = torch.sort(scores, descending=True)
 
-    def remove_invalid(batch_to_succs):
-      return [[x for x in succ if x[2] != -float('inf')] for succ in batch_to_succs]
+      active_span = (sorted_scores != -float('inf')).nonzero()[-1][0] + 1
+      sorted_scores = sorted_scores[:active_span]
+      sort_idx = sort_idx[:active_span]
 
-    successors = remove_invalid(successors)
-    forced_completion_successors = remove_invalid(forced_completion_successors)
+      beam_id = sort_idx // num_actions
+      action_id = sort_idx % num_actions
 
-    def sort_by_score(batch_to_succs):
-      return [sorted(succ, key=lambda x: x[2], reverse=True) for succ in batch_to_succs]
+      beam_id_np = beam_id.cpu().numpy()
+      action_id_np = action_id.cpu().numpy()
+      sorted_scores_np = sorted_scores.cpu().numpy()
 
-    successors = sort_by_score(successors)
-    forced_completion_successors = sort_by_score(forced_completion_successors)
-    successors = [succ[:beam_size] for succ in successors]
-    forced_completion_successors = [succ[:shift_size] for succ
-                                    in forced_completion_successors]
+      successors[batch] = [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
+                           for i in range(min(len(beam_id_np), beam_size))]
+      if pointer < x.size(1):
+        # shift is target for being forced.
+        # shifts = (action_id == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+        shift_in_successors = (action_id[:num_beams] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
+        if shift_in_successors < shift_size:
+          # find and add additional forced shift successors
+          additional = ((action_id[num_beams:] == self.action_dict.a2i['SHIFT'])
+                        .nonzero()[:shift_size - shift_in_successors].squeeze(1)).cpu()
+          additional += num_beams  # add offset
+          successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
+                                for i in additional]
+          forced_completions[batch] = additional.size(0)
+      else:
+        # Only allowed action is reduce, so checking whether the state can be finished suffices.
+        finish_reduces = [beam[batch][b].state.can_finish_by_reduce() for (b, a, s)
+                          in successors[batch]]
+        if len(finish_reduces) < shift_size:
+          remain = shift_size - len(finish_reduces)
+          additional = []
+          for i in range(num_beams, len(beam_id_np)):
+            b = beam_id_np[i]
+            if beam[b].state.can_finish_by_reduce():
+              additional.append(i)
+            if len(additional) >= remain:
+              break
+          successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
+                                for i in additional]
+          forced_completions[batch] = len(additional)
 
-    def make_succ_item(batch_i, succ):
-      beam_i, a_i, score = succ
-      return SuccessorItem(beam[batch_i][beam_i], a_i, score)
+    return successors, forced_completions
 
-    def to_succ_item_list(succs):
-      return [[make_succ_item(batch_i, succ) for succ in batch_succs]
-              for (batch_i, batch_succs) in enumerate(succs)]
-
-    successors = to_succ_item_list(successors)
-    forced_completion_successors = to_succ_item_list(forced_completion_successors)
-
-    return successors, forced_completion_successors
-
-  def reset_beam(self, successors, forced_completion_successors, do_force):
+  def reset_beam(self, successors):
     forced_completions = [0 for _ in range(len(successors))]
     if do_force:
       for b in range(len(successors)):
@@ -844,7 +849,7 @@ class TopDownRNNG(nn.Module):
 
     return new_beam, forced_completions
 
-  def update_stack_rnn(self, items, states, word_vecs, batch_idx):
+  def update_stack_rnn(self, items, states, word_vecs, batch_idx, pointer):
     """
     items and states are flattened ones.
     batch_idx is mapping from index in flattend list to the original batch.
@@ -852,12 +857,17 @@ class TopDownRNNG(nn.Module):
     flattened and has size of (batch_size, num words).
     """
     assert len(items) == len(states)
-    reduce_idx = [i for i, item in enumerate(items) if
-                  self.action_dict.is_reduce(item.action)]
-    non_reduce_idx = [i for i, item in enumerate(items) if
-                      not self.action_dict.is_reduce(item.action)]
 
-    if len(reduce_idx) > 0:
+    batch_idx_tensor = word_vecs.new_tensor(batch_idx, dtype=torch.long)
+    actions = word_vecs.new_tensor([item.action for item in items], dtype=torch.long)
+    reduces = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
+    shifts = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+    nts = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
+
+    new_stack_input = word_vecs.new_zeros(len(items), word_vecs.size(-1))
+
+    if reduces.size(0) > 0:
+      reduce_idx = reduces.cpu().numpy()
       reduce_states = [states[i] for i in reduce_idx]
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce_beam(
         reduce_states)
@@ -865,22 +875,20 @@ class TopDownRNNG(nn.Module):
       reduce_context = self.stack_to_hidden(reduce_context)
       # state.stack_top_h(reduce_batch)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
-    else:
-      new_child = None
 
-    new_stack_input = [None] * len(items)
-    for i, b in enumerate(reduce_idx):
-      new_stack_input[b] = new_child[i]
-    for b in non_reduce_idx:
-      state = states[b]
-      a = items[b].action
-      if self.action_dict.is_shift(a):
-        new_stack_input[b] = word_vecs[batch_idx[b], state.pointer]  # this pointer is the one before doing aciton, so identical to shifting token position.
-      else:
-        assert not self.action_dict.is_pad(a)
-        nt_id = self.action_dict.nt_id(a)
-        new_stack_input[b] = self.nt_emb(word_vecs.new_tensor([nt_id], dtype=torch.long)).squeeze()
-    new_stack_input = torch.stack(new_stack_input, 0)
+      new_stack_input[reduces] = new_child
+
+    if pointer < word_vecs.size(1):
+      shifted_batch_idx = batch_idx_tensor[shifts]
+      shifted_words = word_vecs[shifted_batch_idx, pointer]
+      new_stack_input[shifts] = shifted_words
+    else:
+      assert shifts.size(0) == 0
+
+    nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
+    nt_embs = self.nt_emb(nt_ids)
+    new_stack_input[nts] = nt_embs
+
     stack_top_context = self._collect_stack_top_context_beam(states)
     new_stack_top = self.stack_rnn(new_stack_input, stack_top_context)
 
@@ -901,6 +909,7 @@ class TopDownRNNG(nn.Module):
         else:
           beam[b].append(item)
       accum += l
+    assert accum == sum(beam_lengths)
 
   def _flatten_items(self, items):
     flatten_items = []
@@ -1080,6 +1089,16 @@ class State:
     self.nt_index = nt_index
     self.nt_ids = nt_ids
 
+  def stack_str(self, action_dict):
+    stack_str = ''
+    stack_str = ['<dummy>'] + ['C' for _ in range(len(self.stack)-1)]
+    for i, nt in zip(self.nt_index, self.nt_ids):
+      stack_str[i] = '(' + action_dict.nonterminals[nt]
+    assert self.nopen_parens == len(self.nt_ids) == len(self.nt_index)
+
+    stack_str = ' '.join(stack_str)
+    return '{{[ {} ], pointer={}}}'.format(stack_str, self.pointer)
+
   @staticmethod
   def from_initial_stack(initial_stack_elem):
     return State(stack=[initial_stack_elem])
@@ -1155,25 +1174,30 @@ class BeamItem:
     assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
     return list(reversed(actions[:-1]))
 
-class SuccessorItem:
-  def __init__(self, prev_beam_item, action, score):
-    self.prev_beam_item = prev_beam_item
-    self.action = action
-    self.score = score
-
-  def __eq__(self, other):
-    return (self.prev_beam_item is other.prev_beam_item and
-            self.action == other.action and
-            self.score == other.score)
-
-  def __hash__(self):
-    return hash((id(self.prev_beam_item), self.action, self.score))
-
-  def to_incomplete_beam_item(self):
-    """
-    This BeamItem is incomplete, as its state is just copy of the previous state.
-    Proper action and stack update should be performed.
-    """
-    state = self.prev_beam_item.state.copy()
-    path = self.prev_beam_item.action_path.add_action(self.action, self.score)
+  def next_incomplete_item(self, action, score):
+    state = self.state.copy()
+    path = self.action_path.add_action(action, score)
     return BeamItem(state, path)
+
+# class SuccessorItem:
+#   def __init__(self, prev_beam_item, action, score):
+#     self.prev_beam_item = prev_beam_item
+#     self.action = action
+#     self.score = score
+
+#   def __eq__(self, other):
+#     return (self.prev_beam_item is other.prev_beam_item and
+#             self.action == other.action and
+#             self.score == other.score)
+
+#   def __hash__(self):
+#     return hash((id(self.prev_beam_item), self.action, self.score))
+
+#   def to_incomplete_beam_item(self):
+#     """
+#     This BeamItem is incomplete, as its state is just copy of the previous state.
+#     Proper action and stack update should be performed.
+#     """
+#     state = self.prev_beam_item.state.copy()
+#     path = self.prev_beam_item.action_path.add_action(self.action, self.score)
+#     return BeamItem(state, path)
