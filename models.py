@@ -954,7 +954,7 @@ class TopDownRNNG(nn.Module):
     stack_h_all = []
     for l in range(self.num_layers):
       h = [state.stack[-1][l][0] for state in states]
-      c = [state.stack[-1][l][0] for state in states]
+      c = [state.stack[-1][l][1] for state in states]
       stack_h_all.append((torch.stack(h, 0), torch.stack(c, 0)))
     return stack_h_all
 
