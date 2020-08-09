@@ -12,6 +12,7 @@ from torch import cuda
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
+from tqdm import tqdm
 
 import torch.nn.functional as F
 import numpy as np
@@ -77,7 +78,8 @@ def main(args):
     block_idxs = []
     block_parses = []
     block_surprisals = []
-    for batch in dataset.test_batches(args.block_size):
+    batches = [batch for batch in dataset.test_batches(args.block_size)]
+    for batch in tqdm(batches):
       tokens, batch_idx = batch
       tokens = tokens.cuda()
       parses, surprisals = model.word_sync_beam_search(
