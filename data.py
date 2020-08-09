@@ -4,7 +4,7 @@ import torch
 import pickle
 from collections import defaultdict
 import json
-from utils import pad_items, clean_number
+from utils import pad_items, clean_number, berkeley_unk_conv
 from action_dict import TopDownActionDict
 
 class Vocabulary(object):
@@ -13,26 +13,48 @@ class Vocabulary(object):
   Vocabulary should be constructed from a set of tokens with counts (w2c), a dictionary
   from a word to its count in the training data. (or anything)
   """
-  def __init__(self, pad, unk, w2c_list):
+  def __init__(self, w2c_list, pad = '<pad>', unkmethod = 'unk', unktoken = '<unk>',
+               specials = []):
     self.pad = pad
-    self.unk = unk
     self.padding_idx = 0
-    self.unk_idx = 1
+    self.specials = specials
+    self.unkmethod = unkmethod
+    self.unktoken = unktoken
+    if self.unkmethod == 'unk':
+      if unktoken not in specials:
+        specials.append(unktoken)
 
     assert isinstance(w2c_list, list)
-    self.i2w = [self.pad, self.unk] + [w for w, _ in w2c_list]
+    self.i2w = [self.pad] + specials + [w for w, _ in w2c_list]
     self.w2i = dict([(w, i) for i, w in enumerate(self.i2w)])
     self.w2c = dict(w2c_list)
     self.i2c = dict([(self.w2i[w], c) for w, c in self.w2c.items()])
+
+    if unkmethod == 'unk':
+      self.unk_id = self.w2i[self.unktoken]
+      def _unk_fn(w):
+        return self.unktoken
+      def _unk_id_fn(w_id):
+        return self.unk_id
+    else:
+      def _unk_fn(w):
+        return berkeley_unk_conv(w)
+      def _unk_id_fn(w_id):
+        if 1 <= w_id < 1+len(self.specials):
+          return w_id
+        else:
+          return self.get_id(self.i2w[w_id])
+
+    self.unk_fn = _unk_fn
+    self.unk_id_fn = _unk_id_fn
 
   def size(self):
     return len(self.i2w)
 
   def get_id(self, w):
     if w not in self.w2i:
-      return self.unk_idx
-    else:
-      return self.w2i[w]
+      w = self.unk_fn(w)
+    return self.w2i[w]
 
   def get_count_from_id(self, w_id):
     if w_id not in self.i2c:
@@ -48,30 +70,41 @@ class Vocabulary(object):
 
   # for serialization
   def list_w2c(self):
-    return [(w, self.get_count(w)) for w in self.i2w]
+    return [(w, self.get_count(w)) for w in self.i2w[1+len(self.specials):]]
 
   def dump(self, fn):
     with open(fn, 'wt') as o:
+      o.write(self.pad + '\n')
+      o.write(self.unkmethod + '\n')
+      o.write(self.unktoken + '\n')
+      o.write(' '.join(self.specials) + '\n')
       for w, c in self.list_w2c():
         o.write('{}\t{}\n'.format(w, c))
+
+  def to_json_dict(self):
+    return {'pad': self.pad,
+            'unkmethod': self.unkmethod,
+            'unktoken': self.unktoken,
+            'specials': self.specials,
+            'word_count': self.list_w2c()}
 
   @staticmethod
   def load(self, fn):
     with open(fn) as f:
-      def parse_line(line):
-        w, c = line[:-1].split()
-        return w, int(c)
-      w2c_list = [parse_line(line) for line in f]
-    assert w2c_list[0][1] == 0  # should correspond to <pad>
-    assert w2c_list[1][1] == 0  # should correspond to <unk>
-    return Vocabulary(w2c_list[0][0], w2c_list[1][0], w2c_list[2:])
+      lines = [line for line in f]
+    pad, unkmethod, unktoken, specials = [l.strip() for l in line[:4]]
+    specials = [w for w in specials]
+    def parse_line(line):
+      w, c = line[:-1].split()
+      return w, int(c)
+    w2c_list = [parse_line(line) for line in lines[4:]]
+    return Vocabulary(w2c_list, pad, unkmethod, unktoken, specials)
 
   @staticmethod
   def from_data_json(data):
-    w2c_list = data['vocab']
-    assert w2c_list[0][1] == 0  # should correspond to <pad>
-    assert w2c_list[1][1] == 0  # should correspond to <unk>
-    return Vocabulary(w2c_list[0][0], w2c_list[1][0], w2c_list[2:])
+    d = data['vocab']
+    return Vocabulary(d['word_count'], d['pad'], d['unkmethod'], d['unktoken'],
+                      d['specials'])
 
 class Sentence(object):
   def __init__(self, orig_tokens, tokens, token_ids, tags, actions=[], action_ids=[], tree_str=None):
@@ -93,11 +126,11 @@ class Sentence(object):
                     j.get('action_ids', []),
                     j.get('tree_str', None))
 
-  def random_unked(self, unk_idx, vocab):
+  def random_unked(self, vocab):
     def unkify_rand(w_id):
-      c = vocab.get_count_from_id(w_id)
+      c = vocab. get_count_from_id(w_id)
       if c == 0 or (np.random.rand() < 1 / (1 + c)):
-        return unk_idx
+        return vocab.unk_id_fn(w_id)
       else:
         return w_id
     return [unkify_rand(i) for i in self.token_ids]
@@ -135,7 +168,7 @@ class Dataset(object):
     vocab = vocab or Vocabulary.from_data_json(j)
     action_dict = action_dict or TopDownActionDict(j['nonterminals'])
 
-    return Dataset(sents, batch_size, vocab, action_dict, random_unk)
+    return Dataset(sents, batch_size, vocab, action_dict, random_unk, j['args'])
 
   @staticmethod
   def from_text_file(text_file, batch_size, vocab, action_dict, tagger_fn=None,
@@ -218,7 +251,7 @@ class Dataset(object):
 
     if self.random_unk:
       def conv_sent(i):
-        return self.sents[i].random_unked(self.vocab.unk_idx, self.vocab)
+        return self.sents[i].random_unked(self.vocab)
     else:
       def conv_sent(i):
         return self.sents[i].token_ids

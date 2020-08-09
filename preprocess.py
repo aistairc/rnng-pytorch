@@ -107,7 +107,7 @@ def get_data(args):
     pad = '<pad>'
     unk = '<unk>'
     def make_vocab(textfile, seqlength, minseqlength,lowercase, replace_num,
-                   vocabsize, vocabminfreq, apply_length_filter=True):
+                   vocabsize, vocabminfreq, unkmethod, apply_length_filter=True):
         w2c = defaultdict(int)
         for tree in open(textfile, 'r'):
             tree = tree.strip()
@@ -123,12 +123,17 @@ def get_data(args):
 
             for word in sent:
                 w2c[word] += 1
+        if unkmethod == 'berkeleyrule':
+            berkeley_unks = set([utils.berkeley_unk_conv(w) for w, c in w2c.items()])
+            specials = list(berkeley_unks)
+        else:
+            specials = [unk]
         if vocabminfreq:
             w2c = dict([(w, c) for w, c in w2c.items() if c >= vocabminfreq])
         elif vocabsize > 0 and len(w2c) > vocabsize:
             sorted_wc = sorted(list(w2c.items()), key=lambda x:x[1], reverse=True)
             w2c = dict(sorted_wc[:vocabsize])
-        return Vocabulary(pad, unk, list(w2c.items()))
+        return Vocabulary(list(w2c.items()), pad, unkmethod, unk, specials)
 
     def get_nonterminals(textfiles):
         nts = set()
@@ -168,7 +173,7 @@ def get_data(args):
 
         # Write output
         f = {"sentences": [s.to_dict() for s in sentences],
-             "vocab": vocab.list_w2c(),
+             "vocab": vocab.to_json_dict(),
              "nonterminals": nonterminals,
              "pad_token": pad,
              "unk_token": unk,
@@ -188,7 +193,8 @@ def get_data(args):
     else:
         print("First pass through data to get vocab...")
         vocab = make_vocab(args.trainfile, args.seqlength, args.minseqlength,
-                           args.lowercase, args.replace_num, args.vocabsize, args.vocabminfreq)
+                           args.lowercase, args.replace_num, args.vocabsize, args.vocabminfreq,
+                           args.unkmethod, 1)
 
     vocab.dump(args.outputfile + ".vocab")
     print("Vocab size: {}".format(len(vocab.i2w)))
@@ -213,6 +219,8 @@ def main(arguments):
     parser.add_argument('--vocabminfreq', help="Minimum frequency for vocab. Use this instead of "
                                                 "vocabsize if > 1",
                                                 type=int, default=0)
+    parser.add_argument('--unkmethod', help="How to replace an unknown token.", choices=['unk', 'berkeleyrule'],
+                        default='unk')
     parser.add_argument('--lowercase', help="Lower case", type=bool, default=False)
     parser.add_argument('--replace_num', help="Replace numbers with N", type=bool, default=False)
     parser.add_argument('--trainfile', help="Path to training data.", required=True)
