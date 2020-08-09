@@ -45,6 +45,7 @@ parser.add_argument('--num_epochs', default=18, type=int, help='number of traini
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
 #parser.add_argument('--mode', default='unsupervised', type=str, choices=['unsupervised', 'supervised'])
 parser.add_argument('--lr', default=1, type=float, help='starting learning rate')
+parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action'])
 parser.add_argument('--decay', default=0.5, type=float, help='')
 parser.add_argument('--param_init', default=0, type=float, help='parameter initialization (over uniform)')
 parser.add_argument('--max_grad_norm', default=5, type=float, help='gradient clipping parameter')
@@ -97,10 +98,6 @@ def main(args):
     start_time = time.time()
     epoch += 1
     logger.info('Starting epoch {}'.format(epoch))
-    # train_nll_recon = 0.
-    # train_nll_iwae = 0.
-    # train_kl = 0.
-    # train_q_entropy = 0.
     num_sents = 0.
     num_words = 0.
     num_actions = 0
@@ -117,6 +114,12 @@ def main(args):
       loss, a_loss, w_loss, _ = model(token_ids, action_ids)
       total_a_ll += -a_loss.sum().detach().item()
       total_w_ll += -w_loss.sum().detach().item()
+      if args.loss_normalize == 'sum':
+        loss = loss
+      elif args.loss_normalize == 'batch':
+        loss = loss / token_ids.size(0)
+      elif args.loss_normalize == 'action':
+        loss = loss / a_loss.size(0)
       loss.backward()
       if args.max_grad_norm > 0:
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
