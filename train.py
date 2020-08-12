@@ -57,6 +57,7 @@ def main(args):
   logger.info('Args: {}'.format(args))
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
+  torch.cuda.manual_seed(args.seed)
   train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=not args.no_random_unk)
   vocab = train_data.vocab
   action_dict = train_data.action_dict
