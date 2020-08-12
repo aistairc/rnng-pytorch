@@ -510,64 +510,34 @@ class TopDownRNNG(nn.Module):
 
     self.initial_emb = nn.Sequential(nn.Embedding(1, w_dim), self.dropout)
 
-    # self.zero_word = self.initial_emb[0].weight.new_zeros(w_dim)
-
   def forward(self, x, actions, initial_stack = None):
     assert isinstance(x, torch.Tensor)
     assert isinstance(actions, torch.Tensor)
-    if initial_stack is None:
-      initial_stack = self.get_initial_stack(x)
-    state = TopDownState(initial_stack, x.size(1))
 
+    states = self.initial_states(x, initial_stack)
     word_vecs = self.emb(x)
-    step = self.unroll_state(state, word_vecs, actions)
-    assert step == actions.size(1)
+    action_contexts = self.unroll_states(states, word_vecs, actions)
 
-    action_contexts = state.action_contexts()
-    action_contexts = self.stack_to_hidden(action_contexts)
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
     loss = (a_loss.sum() + w_loss.sum())
-    return loss, a_loss, w_loss, state
+    return loss, a_loss, w_loss, states
 
-  def unroll_state(self, state, word_vecs, actions):
+  def unroll_states(self, states, word_vecs, actions):
+    hs = [self.stack_top_h(states)]
     step = 0
-    while not state.all_finished():
+    _batch_idx = word_vecs.new_zeros(1, word_vecs.size(0), dtype=torch.long)
+    while not all(state.finished() for state in states):
       assert step < actions.size(1)
-      self.one_step_for_train(state, word_vecs, actions[:, step])
+
+      action = actions[:, step]
+      shift_idx = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+      self.update_stack_rnn_train(states, actions, word_vecs, step)
+      hs.append(self.stack_top_h(states))
       step += 1
-    return step
-
-  def one_step_for_train(self, state, word_vecs, action):
-    reduce_batch = self._reduce_batch(state, action)
-    non_reduce_batch = self._non_reduce_batch(state, action)
-    if len(reduce_batch) > 0:
-      children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(state, reduce_batch)
-      reduce_context = state.stack_top_h(reduce_batch)
-      reduce_context = self.stack_to_hidden(reduce_context)
-      new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
-    else:
-      new_child = None
-
-    new_stack_input = [None] * action.size(0)
-    for i, b in enumerate(reduce_batch):
-      new_stack_input[b] = new_child[i]
-    for b in non_reduce_batch:
-      a = action[b]
-      if self.action_dict.is_shift(a):
-        new_stack_input[b] = word_vecs[b, state.pointer[b]]
-      elif self.action_dict.is_pad(a):  # finished state
-        new_stack_input[b] = self.emb(word_vecs.new_tensor([self.padding_idx],
-                                                           dtype=torch.long)).squeeze()
-      else:
-        assert self.action_dict.is_nt(a)
-        nt_id = self.action_dict.nt_id(a)
-        new_stack_input[b] = self.nt_emb(word_vecs.new_tensor([nt_id], dtype=torch.long)).squeeze()
-    new_stack_input = torch.stack(new_stack_input, 0)
-    stack_top_context = state.stack_top_context()
-    new_stack_top = self.stack_rnn(new_stack_input, stack_top_context)
-    state.update_stack(new_stack_top, new_stack_input)
-    state.do_action(action, self.action_dict)
+    batch_first_hs = torch.stack(hs[:-1], dim=1)
+    action_contexts = self.stack_to_hidden(batch_first_hs)
+    return action_contexts
 
   def action_loss(self, actions, action_dict, hiddens):
     assert hiddens.size()[:2] == actions.size()
@@ -602,37 +572,6 @@ class TopDownRNNG(nn.Module):
     iemb = self.initial_emb(x.new_zeros(x.size(0)))
     return self.stack_rnn(iemb, None)
 
-  def _reduce_batch(self, state, action):
-    return [b for b, a in enumerate(action) if self.action_dict.is_reduce(a)]
-
-  def _non_reduce_batch(self, state, action):
-    return [b for b, a in enumerate(action) if not self.action_dict.is_reduce(a)]
-
-  def _collect_children_for_reduce(self, state, reduce_batch):
-    children = []
-    nt = []
-    nt_ids = []
-    ch_lengths = []
-    for b in reduce_batch:
-      reduced_nt, reduced_trees, nt_id = state.reduce_stack(b)
-      nt.append(reduced_nt)
-      nt_ids.append(nt_id)
-      children.append(reduced_trees)
-      ch_lengths.append(len(reduced_trees))
-
-    max_ch_len = max(ch_lengths)
-    for b, b_child in enumerate(children):
-      if len(b_child) < max_ch_len:
-        children[b] += [b_child[0].new_zeros(b_child[0].size())] * (max_ch_len - len(b_child))
-      children[b] = torch.stack(children[b], 0)
-
-    children = torch.stack(children, 0)
-    nt = torch.stack(nt, 0)
-    nt_ids = nt.new_tensor(nt_ids, dtype=torch.long)
-    ch_lengths = nt_ids.new_tensor(ch_lengths)
-
-    return (children, ch_lengths, nt, nt_ids)
-
   def word_sync_beam_search(self, x, beam_size, word_beam_size = 0, shift_size = 0):
     self.eval()
 
@@ -656,8 +595,7 @@ class TopDownRNNG(nn.Module):
           forced_completions[i] += c
 
         all_items, batch_idx = self._flatten_items(new_beam)
-        all_states = [item.state for item in all_items]
-        self.update_stack_rnn(all_items, all_states, word_vecs, batch_idx, pointer)
+        self.update_stack_rnn_beam(all_items, word_vecs, batch_idx, pointer)
 
         beam_lengths = [len(batch_beam) for batch_beam in new_beam]
         self.update_beam_and_word_completed(
@@ -690,10 +628,17 @@ class TopDownRNNG(nn.Module):
     return parses, surprisals
 
   def initial_beam(self, x):
-    initial_stack = self.get_initial_stack(x)
-    initial_hs = [[(stack_layer[0][b], stack_layer[1][b]) for stack_layer in initial_stack]
-                  for b in range(x.size(0))]
+    initial_hs = self._initial_hs(x)
     return [[BeamItem.from_initial_stack(h)] for h in initial_hs]
+
+  def initial_states(self, x, initial_stack = None):
+    initial_hs = self._initial_hs(x, initial_stack)
+    return [State.from_initial_stack(h) for h in initial_hs]
+
+  def _initial_hs(self, x, initial_stack = None):
+    initial_stack = initial_stack or self.get_initial_stack(x)
+    return [[(stack_layer[0][b], stack_layer[1][b]) for stack_layer in initial_stack]
+            for b in range(x.size(0))]
 
   def get_successors(self, x, pointer, beam, beam_size, shift_size):
     all_items, _ = self._flatten_items(beam)
@@ -770,7 +715,6 @@ class TopDownRNNG(nn.Module):
     return torch.stack([state.stack[-1][-1][0] for state in states], dim=0)
 
   def scores_to_successors(self, x, pointer, beam, total_scores, beam_size, shift_size):
-    # If total_scores is a list of two dimensional tensor.
     successors = [[] for _ in range(len(total_scores))]
     forced_completions = [0 for _ in range(len(total_scores))]
     for batch, batch_total_scores in enumerate(total_scores):
@@ -795,7 +739,6 @@ class TopDownRNNG(nn.Module):
                            for i in range(min(len(beam_id_np), beam_size))]
       if pointer < x.size(1):
         # shift is target for being forced.
-        # shifts = (action_id == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
         shift_in_successors = (action_id[:num_beams] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
         if shift_in_successors < shift_size:
           # find and add additional forced shift successors
@@ -824,67 +767,66 @@ class TopDownRNNG(nn.Module):
 
     return successors, forced_completions
 
-  def reset_beam(self, successors):
-    forced_completions = [0 for _ in range(len(successors))]
-    if do_force:
-      for b in range(len(successors)):
-        succ_set = set(successors[b])
-        for s in forced_completion_successors[b]:
-          if s not in succ_set:
-            successors[b].append(s)
-            forced_completions[b] += 1
+  def update_stack_rnn_train(self, states, actions, word_vecs, step):
+    action = actions[:, step]
+    shift_batch = (action == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+    pointer = action.new_tensor([state.pointer for state in states])
+    shift_batch_word_vecs = word_vecs[shift_batch]  # (num_shifted, sent len, w_dim)
+    shift_batch_pointer = pointer[shift_batch]
+    idx = shift_batch_pointer.view(-1, 1, 1).expand(-1, 1, word_vecs.size(-1))
+    shifted_embs = torch.gather(shift_batch_word_vecs, 1, idx).squeeze(1)
 
-    new_beam = [[succ.to_incomplete_beam_item() for succ in batch_succs]
-                for batch_succs in successors]
+    self.update_stack_rnn(states, action, shift_batch, shifted_embs)
 
-    return new_beam, forced_completions
-
-  def update_stack_rnn(self, items, states, word_vecs, batch_idx, pointer):
+  def update_stack_rnn_beam(self, items, word_vecs, batch_idx, pointer):
     """
-    items and states are flattened ones.
-    batch_idx is mapping from index in flattend list to the original batch.
-    This is necessary to get correct mapping from word_vecs, which is not
-    flattened and has size of (batch_size, num words).
+    This method does some preparation for update_stack_rnn, which is used also
+    for training.
+
+    items is a flattened tensor. batch_idx is mapping from index in flattend
+    list to the original batch, which is necessary to get correct mapping from
+    word_vecs, which is not flattened and has size of (batch_size, num words).
     """
-    assert len(items) == len(states)
+    states = [item.state for item in items]
+    actions = word_vecs.new_tensor([item.action for item in items], dtype=torch.long)
 
     batch_idx_tensor = word_vecs.new_tensor(batch_idx, dtype=torch.long)
-    actions = word_vecs.new_tensor([item.action for item in items], dtype=torch.long)
-    reduces = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
     shifts = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+    shifted_batch_idx = batch_idx_tensor[shifts]
+    shifted_words = word_vecs[shifted_batch_idx, pointer]
+
+    self.update_stack_rnn(states, actions, shifts, shifted_words)
+
+  def update_stack_rnn(self, states, actions, shift_idx, shifted_embs):
+    assert actions.size(0) == len(states)
+    assert shift_idx.size(0) == shifted_embs.size(0)
+
+    reduces = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
     nts = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
 
-    new_stack_input = word_vecs.new_zeros(len(items), word_vecs.size(-1))
+    new_stack_input = shifted_embs.new_zeros(actions.size(0), self.w_dim)
 
     if reduces.size(0) > 0:
       reduce_idx = reduces.cpu().numpy()
       reduce_states = [states[i] for i in reduce_idx]
-      children, ch_lengths, nt, nt_id = self._collect_children_for_reduce_beam(
-        reduce_states)
+      children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
       reduce_context = self._collect_stack_top_h_beam(reduce_states)
       reduce_context = self.stack_to_hidden(reduce_context)
-      # state.stack_top_h(reduce_batch)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
-
       new_stack_input[reduces] = new_child
 
-    if pointer < word_vecs.size(1):
-      shifted_batch_idx = batch_idx_tensor[shifts]
-      shifted_words = word_vecs[shifted_batch_idx, pointer]
-      new_stack_input[shifts] = shifted_words
-    else:
-      assert shifts.size(0) == 0
+    new_stack_input[shift_idx] = shifted_embs
 
     nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
     nt_embs = self.nt_emb(nt_ids)
     new_stack_input[nts] = nt_embs
 
-    stack_top_context = self._collect_stack_top_context_beam(states)
+    stack_top_context = self._collect_stack_top_context(states)
     new_stack_top = self.stack_rnn(new_stack_input, stack_top_context)
 
     for b in range(len(states)):
       states[b].update_stack(new_stack_top, new_stack_input, b)
-      items[b].do_action(self.action_dict)
+      states[b].do_action(actions[b].item(), self.action_dict)
 
   def update_beam_and_word_completed(self, beam, word_completed, items, beam_lengths, last_token=False):
     accum = 0
@@ -918,8 +860,7 @@ class TopDownRNNG(nn.Module):
     assert accum_idx == items.size(0)
     return de_items  # List[Tensor]
 
-  def _collect_children_for_reduce_beam(self, reduce_states):
-    # todo: integrate with _collect_children_for_reduce
+  def _collect_children_for_reduce(self, reduce_states):
     children = []
     nt = []
     nt_ids = []
@@ -948,7 +889,7 @@ class TopDownRNNG(nn.Module):
   def _collect_stack_top_h_beam(self, states):
     return torch.stack([state.stack[-1][-1][0] for state in states], 0)
 
-  def _collect_stack_top_context_beam(self, states):
+  def _collect_stack_top_context(self, states):
     stack_h_all = []
     for l in range(self.num_layers):
       h = [state.stack[-1][l][0] for state in states]
@@ -963,121 +904,22 @@ class TopDownRNNG(nn.Module):
       ll.append(torch.logsumexp(torch.tensor(scores), 0).item())
     return ll
 
-class TopDownState(object):
-  def __init__(self, initial_stack, sent_len):
-    self.sent_len = sent_len
-    self.batch_size = initial_stack[0][0].size(0)
-    self.stack_top_history = [initial_stack]  # Collection of last stack element at each step. Each element is a list of size (n_layers, 2). 2 is for (h, c). Each list elment is a tensor of size (batch_size, h_dim).
-
-    self.stack = [[] for _ in range(self.batch_size)]  # correspond to stack2
-    self.stack_trees = [[] for _ in range(self.batch_size)]  # correspond to stack_child (rather than keeping (h, c), we only keep h, came from composition)
-    self.pointer = [0] * self.batch_size
-    self.actions = [[] for _ in range(self.batch_size)]
-    self.nopen_parens = [0] * self.batch_size
-    self.ncons_nts = [0] * self.batch_size
-    self.nt_index = [[] for _ in range(self.batch_size)]  # stack of nt index (e.g., [1, 2, 5] means 1,2,5-th elements of stack are open nt)
-    self.nt_ids = [[] for _ in range(self.batch_size)]
-
-    self.state_length = [None] * self.batch_size  # will be filled with (# total actions + 1) for each sent.
-
-    for b in range(self.batch_size):
-      self.stack[b].append([[stack_layer[0][b], stack_layer[1][b]]
-                            for stack_layer in initial_stack])
-    self.num_layers = len(self.stack[0][0])
-
-  def action_contexts(self):
-    """Transform self.stack_top_history to a tensor of size (batch_size, history_len, h_dim).
-
-    The first and second dimentions should be equal to the size of actions matrix, to allow indexing
-    with action values.
-    """
-    hs = [h[-1][0] for h in self.stack_top_history[:-1]]  # last state is a finished state, which is not used for parameter updates.
-    return torch.stack(hs, 1)
-
-  def stack_top_h(self, bs=None):
-    # bs: target batch index
-    if bs is None:
-      bs = range(self.batch_size)
-    if isinstance(bs, int):
-      bs = [bs]
-    return torch.stack([self.stack[b][-1][-1][0] for b in bs], 0)
-
-  def stack_top_context(self):
-    """Arranging self.stack to obtain context vector for stack lstm update (with a new element).
-
-    Differently from self.stack_top_h, which returns a single tensor of size (batch_size, h_dim) summarizing
-    last layer hidden cells, this method summarizes all layer information, used for update in SeqLSTM.
-
-    self.stack: (batch_size, stack_len, layer, 2) -> (h_dim)
-    return: (layer, 2) -> (batch_size, h_dim)
-    """
-    stack_h_all = []
-    for l in range(self.num_layers):
-      h = [self.stack[b][-1][l][0] for b in range(self.batch_size)]
-      c = [self.stack[b][-1][l][1] for b in range(self.batch_size)]
-      stack_h_all.append((torch.stack(h, 0), torch.stack(c, 0)))
-    return stack_h_all
-
-  def update_stack(self, new_stack_top, new_tree_elem):
-    # new_stack_top: (layer, 2) -> Tensor(batch_size, h_dim)
-    # new_tree_elem: Tensor(batch_size, w_dim)
-    self.stack_top_history.append(new_stack_top)
-    for b in range(self.batch_size):
-      if not self.finished(b):
-        self.stack[b].append([[layer[0][b], layer[1][b]] for layer in new_stack_top])
-        self.stack_trees[b].append(new_tree_elem[b])
-
-  def do_action(self, action, action_dict):
-    for b, a in enumerate(action):
-      a = a.item()
-      self.actions[b].append(a)
-      if action_dict.is_shift(a):
-        self.pointer[b] += 1
-        self.ncons_nts[b] = 0
-      elif action_dict.is_nt(a):
-        nt_id = action_dict.nt_id(a)
-        self.nopen_parens[b] += 1
-        self.ncons_nts[b] += 1
-        self.nt_index[b].append(len(self.stack[b]) - 1)
-        self.nt_ids[b].append(nt_id)
-      elif action_dict.is_reduce(a):
-        self.nopen_parens[b] -= 1
-        self.ncons_nts[b] = 0
-        if self.nopen_parens[b] == 0 and self.pointer[b] == self.sent_len:  # finished
-          self.state_length[b] = len(self.stack_top_history)
-          assert self.state_length[b] == len(self.actions[b]) + 1
-
-  def reduce_stack(self, b):
-    open_idx = self.nt_index[b].pop()
-    nt_id = self.nt_ids[b].pop()
-    self.stack[b] = self.stack[b][:open_idx]
-    reduce_trees = self.stack_trees[b][open_idx-1:]
-    self.stack_trees[b] = self.stack_trees[b][:open_idx-1]
-    assert len(reduce_trees) > 1
-    return reduce_trees[0], reduce_trees[1:], nt_id
-
-  def all_finished(self):
-    return all([self.finished(b) for b in range(self.batch_size)])
-
-  def finished(self, b):
-    return self.state_length[b] is not None
-
 class State:
   def __init__(self,
                pointer = 0,
-               stack = [],
-               stack_trees = [],
+               stack = None,
+               stack_trees = None,
                nopen_parens = 0,
                ncons_nts = 0,
-               nt_index = [],
-               nt_ids = []):
+               nt_index = None,
+               nt_ids = None):
     self.pointer = pointer
-    self.stack = stack
-    self.stack_trees = stack_trees
+    self.stack = stack or []
+    self.stack_trees = stack_trees or []
     self.nopen_parens = nopen_parens
     self.ncons_nts = ncons_nts
-    self.nt_index = nt_index
-    self.nt_ids = nt_ids
+    self.nt_index = nt_index or []
+    self.nt_ids = nt_ids or []
 
   def stack_str(self, action_dict):
     stack_str = ''
@@ -1095,6 +937,9 @@ class State:
 
   def can_finish_by_reduce(self):
     return self.nopen_parens == 1
+
+  def finished(self):
+    return self.pointer > 0 and self.nopen_parens == 0
 
   def copy(self):
     return State(self.pointer, self.stack[:], self.stack_trees[:],
