@@ -717,7 +717,8 @@ class TopDownRNNG(nn.Module):
     for batch, batch_total_scores in enumerate(total_scores):
       if batch_total_scores.size(0) == 0:
         continue  # this batch is finished.
-      num_beams, num_actions = batch_total_scores.size()
+      _, num_actions = batch_total_scores.size()
+
       scores = batch_total_scores.view(-1)
       sorted_scores, sort_idx = torch.sort(scores, descending=True)
 
@@ -736,12 +737,12 @@ class TopDownRNNG(nn.Module):
                            for i in range(min(len(beam_id_np), beam_size))]
       if pointer < x.size(1):
         # shift is target for being forced.
-        shift_in_successors = (action_id[:num_beams] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
+        shift_in_successors = (action_id[:beam_size] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
         if shift_in_successors < shift_size:
           # find and add additional forced shift successors
           additional = ((action_id[beam_size:] == self.action_dict.a2i['SHIFT'])
                         .nonzero()[:shift_size - shift_in_successors].squeeze(1)).cpu()
-          additional += num_beams  # add offset
+          additional += beam_size  # add offset
           successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
                                 for i in additional]
           forced_completions[batch] = additional.size(0)
@@ -754,7 +755,7 @@ class TopDownRNNG(nn.Module):
           additional = []
           for i in range(beam_size, len(beam_id_np)):
             b = beam_id_np[i]
-            if beam[b].state.can_finish_by_reduce():
+            if beam[batch][b].state.can_finish_by_reduce():
               additional.append(i)
             if len(additional) >= remain:
               break
