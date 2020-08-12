@@ -753,7 +753,7 @@ class TopDownRNNG(nn.Module):
         if len(finish_reduces) < shift_size:
           remain = shift_size - len(finish_reduces)
           additional = []
-          for i in range(num_beams, len(beam_id_np)):
+          for i in range(beam_size, len(beam_id_np)):
             b = beam_id_np[i]
             if beam[b].state.can_finish_by_reduce():
               additional.append(i)
