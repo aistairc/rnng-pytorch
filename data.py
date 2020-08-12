@@ -30,30 +30,27 @@ class Vocabulary(object):
     self.w2c = dict(w2c_list)
     self.i2c = dict([(self.w2i[w], c) for w, c in self.w2c.items()])
 
-    if unkmethod == 'unk':
-      self.unk_id = self.w2i[self.unktoken]
-      def _unk_fn(w):
-        return self.unktoken
-      def _unk_id_fn(w_id):
-        return self.unk_id
+  def to_unk(self, w):
+    if self.unkmethod == 'unk':
+      return self.unktoken
     else:
-      def _unk_fn(w):
-        return berkeley_unk_conv(w)
-      def _unk_id_fn(w_id):
-        if 1 <= w_id < 1+len(self.specials):
-          return w_id
-        else:
-          return self.get_id(self.i2w[w_id])
+      return berkeley_unk_conv(w)
 
-    self.unk_fn = _unk_fn
-    self.unk_id_fn = _unk_id_fn
+  def to_unk_id(self, w_id):
+    if self.unkmethod == 'unk':
+      return self.unk_id
+    else:
+      if 1 <= w_id < 1+len(self.specials):
+        return w_id
+      else:
+        return self.get_id(self.i2w[w_id])
 
   def size(self):
     return len(self.i2w)
 
   def get_id(self, w):
     if w not in self.w2i:
-      w = self.unk_fn(w)
+      w = self.to_unk(w)
     return self.w2i[w]
 
   def get_count_from_id(self, w_id):
@@ -130,7 +127,7 @@ class Sentence(object):
     def unkify_rand(w_id):
       c = vocab. get_count_from_id(w_id)
       if c == 0 or (np.random.rand() < 1 / (1 + c)):
-        return vocab.unk_id_fn(w_id)
+        return vocab.to_unk_id(w_id)
       else:
         return w_id
     return [unkify_rand(i) for i in self.token_ids]
