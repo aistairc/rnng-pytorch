@@ -529,8 +529,7 @@ class TopDownRNNG(nn.Module):
       assert step < actions.size(1)
 
       action = actions[:, step]
-      shift_idx = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
-      self.update_stack_rnn_train(states, actions, word_vecs, step)
+      self.update_stack_rnn_train(states, action, word_vecs)
       hs.append(self.stack_top_h(states))
       step += 1
     batch_first_hs = torch.stack(hs[:-1], dim=1)
@@ -765,8 +764,7 @@ class TopDownRNNG(nn.Module):
 
     return successors, forced_completions
 
-  def update_stack_rnn_train(self, states, actions, word_vecs, step):
-    action = actions[:, step]
+  def update_stack_rnn_train(self, states, action, word_vecs):
     shift_batch = (action == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
     pointer = action.new_tensor([state.pointer for state in states])
     shift_batch_word_vecs = word_vecs[shift_batch]  # (num_shifted, sent len, w_dim)
@@ -790,8 +788,15 @@ class TopDownRNNG(nn.Module):
 
     batch_idx_tensor = word_vecs.new_tensor(batch_idx, dtype=torch.long)
     shifts = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+
     shifted_batch_idx = batch_idx_tensor[shifts]
-    shifted_words = word_vecs[shifted_batch_idx, pointer]
+    if pointer < word_vecs.size(1):
+      shifted_words = word_vecs[shifted_batch_idx, pointer]
+    else:
+      # At end of sentence. Since shift is not allowed, shifted_words will become
+      # empty. We have to process this condition separately.
+      assert shifted_batch_idx.size(0) == 0
+      shifted_words = word_vecs[shifted_batch_idx, -1]
 
     self.update_stack_rnn(states, actions, shifts, shifted_words)
 
