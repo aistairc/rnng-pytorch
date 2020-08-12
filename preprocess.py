@@ -141,8 +141,9 @@ def get_data(args):
             for tree in open(fn, 'r'):
                 tree = tree.strip()
                 nts.update(re.findall(r'(?=\(([^\s]+)\s\()', tree))
+        nts = sorted(list(nts))
         print('Found nonterminals: {}'.format(nts))
-        return list(nts)
+        return nts
 
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
                 outfile, vocab, action_dict, apply_length_filter=True):
