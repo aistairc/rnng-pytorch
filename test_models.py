@@ -160,138 +160,138 @@ class TestModels(unittest.TestCase):
 
         self.assertEqual(a_loss.size(), (18,))
 
-    def test_action_path(self):
-        start = ActionPath()
-        end = start.add_action(1, 1.0).add_action(3, 3.0).add_action(2, 5.0)
-        item = BeamItem(None, end)
-        self.assertEqual(item.parse_actions(), [1, 3, 2])
+    # def test_action_path(self):
+    #     start = ActionPath()
+    #     end = start.add_action(1, 1.0).add_action(3, 3.0).add_action(2, 5.0)
+    #     item = BeamItem(None, end)
+    #     self.assertEqual(item.parse_actions(), [1, 3, 2])
 
-    def test_successor_item(self):
-        state1 = State()
-        state2 = state1.copy()
-        state2.nt_index.append(3)
-        self.assertTrue(state1.nt_index != state2.nt_index)
+    # def test_successor_item(self):
+    #     state1 = State()
+    #     state2 = state1.copy()
+    #     state2.nt_index.append(3)
+    #     self.assertTrue(state1.nt_index != state2.nt_index)
 
-        item = BeamItem(state2, ActionPath(None, 2, 2.0))
-        item2 = BeamItem(state1, ActionPath(None, 2, 2.0))
+    #     item = BeamItem(state2, ActionPath(None, 2, 2.0))
+    #     item2 = BeamItem(state1, ActionPath(None, 2, 2.0))
 
-        succ1 = SuccessorItem(item, 1, 1.0)
-        succ2 = SuccessorItem(item, 1, 1.0)
-        succ3 = SuccessorItem(item2, 1, 1.0)
+    #     succ1 = SuccessorItem(item, 1, 1.0)
+    #     succ2 = SuccessorItem(item, 1, 1.0)
+    #     succ3 = SuccessorItem(item2, 1, 1.0)
 
-        self.assertEqual(succ1, succ2)
-        self.assertNotEqual(succ1, succ3)
+    #     self.assertEqual(succ1, succ2)
+    #     self.assertNotEqual(succ1, succ3)
 
-        succ_set = set([succ1, succ3])
-        self.assertTrue(succ2 in succ_set)
+    #     succ_set = set([succ1, succ3])
+    #     self.assertTrue(succ2 in succ_set)
 
-        item_dummy = BeamItem(state2, ActionPath(None, 2, 2.0))
-        succ1_dummy = SuccessorItem(item_dummy, 1, 1.0)
-        self.assertNotEqual(succ1_dummy, succ1)  # Even with the same content (numbers), two succs are different if addresses of BeamItem are different.
+    #     item_dummy = BeamItem(state2, ActionPath(None, 2, 2.0))
+    #     succ1_dummy = SuccessorItem(item_dummy, 1, 1.0)
+    #     self.assertNotEqual(succ1_dummy, succ1)  # Even with the same content (numbers), two succs are different if addresses of BeamItem are different.
 
-    def test_reset_beam(self):
-        model = self._get_simple_top_down_model()
-        state = State()
-        item1 = BeamItem(state, ActionPath(None, 2, 2.0))
-        item2 = BeamItem(state, ActionPath(None, 2, 2.0))
-        succ1 = SuccessorItem(item1, 1, 1.0)
-        succ2 = SuccessorItem(item2, 1, 1.0)
-        succ3 = SuccessorItem(item1, 1, 1.0)
-        new_beam, forced_completions = model.reset_beam([[succ1]], [[succ2, succ3]], True)
-        self.assertEqual([len(b) for b in new_beam], [2])
-        self.assertEqual(forced_completions, [1])
+    # def test_reset_beam(self):
+    #     model = self._get_simple_top_down_model()
+    #     state = State()
+    #     item1 = BeamItem(state, ActionPath(None, 2, 2.0))
+    #     item2 = BeamItem(state, ActionPath(None, 2, 2.0))
+    #     succ1 = SuccessorItem(item1, 1, 1.0)
+    #     succ2 = SuccessorItem(item2, 1, 1.0)
+    #     succ3 = SuccessorItem(item1, 1, 1.0)
+    #     new_beam, forced_completions = model.reset_beam([[succ1]], [[succ2, succ3]], True)
+    #     self.assertEqual([len(b) for b in new_beam], [2])
+    #     self.assertEqual(forced_completions, [1])
 
-    def test_get_successors(self):
-        model = self._get_simple_top_down_model()
-        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        initial_beam = model.initial_beam(x)
-        beam = initial_beam
-        successors, forced_completion_successors = model.get_successors(x, 0, beam, 5, 2)
-        self.assertEqual(forced_completion_successors, [[], []])  # shift is prohibited for initial action
-        self.assertEqual([len(s) for s in successors], [4, 4])
-        self.assertTrue(all((successors[0][i].score > successors[0][i+1].score and
-                             successors[0][i].score != -float('inf'))
-                            for i in range(len(successors[0])-1)))
+    # def test_get_successors(self):
+    #     model = self._get_simple_top_down_model()
+    #     x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+    #     initial_beam = model.initial_beam(x)
+    #     beam = initial_beam
+    #     successors, forced_completion_successors = model.get_successors(x, 0, beam, 5, 2)
+    #     self.assertEqual(forced_completion_successors, [[], []])  # shift is prohibited for initial action
+    #     self.assertEqual([len(s) for s in successors], [4, 4])
+    #     self.assertTrue(all((successors[0][i].score > successors[0][i+1].score and
+    #                          successors[0][i].score != -float('inf'))
+    #                         for i in range(len(successors[0])-1)))
 
-        def simulate(actions):
-            return self._simulate_beam_item(
-                initial_beam[0][0], actions, model.action_dict, model.w_dim)
+    #     def simulate(actions):
+    #         return self._simulate_beam_item(
+    #             initial_beam[0][0], actions, model.action_dict, model.w_dim)
 
-        # shift is valid after an NT
-        beam = [[simulate(['NT(S)'])],
-                [simulate(['NT(NP)', 'NT(NP)']),
-                 simulate(['NT(NP)', 'NT(VP)'])]]
-        successors, forced_completion_successors = model.get_successors(x, 0, beam, 8, 2)
-        self.assertEqual([len(s) for s in forced_completion_successors], [1, 2])
-        self.assertEqual([len(s) for s in successors], [5, 8])
-        self.assertTrue(all((successors[0][i].score > successors[0][i+1].score and
-                             successors[0][i].score != -float('inf'))
-                            for i in range(len(successors[0])-1)))
+    #     # shift is valid after an NT
+    #     beam = [[simulate(['NT(S)'])],
+    #             [simulate(['NT(NP)', 'NT(NP)']),
+    #              simulate(['NT(NP)', 'NT(VP)'])]]
+    #     successors, forced_completion_successors = model.get_successors(x, 0, beam, 8, 2)
+    #     self.assertEqual([len(s) for s in forced_completion_successors], [1, 2])
+    #     self.assertEqual([len(s) for s in successors], [5, 8])
+    #     self.assertTrue(all((successors[0][i].score > successors[0][i+1].score and
+    #                          successors[0][i].score != -float('inf'))
+    #                         for i in range(len(successors[0])-1)))
 
-        # reduce is valid after SHIFT
-        beam = [[simulate(['NT(S)', 'NT(NP)', 'NT(NP)', 'SHIFT'])],  # can reduce
-                [simulate(['NT(NP)', 'NT(NP)', 'SHIFT']),  # can reduce
-                 simulate(['NT(NP)', 'SHIFT', 'NT(VP)'])]]  # cannot reduce
-        successors, forced_completion_successors = model.get_successors(x, 0, beam, 12, 2)
-        self.assertEqual([len(s) for s in forced_completion_successors], [1, 2])
-        self.assertEqual([len(s) for s in successors], [6, 6+5])
+    #     # reduce is valid after SHIFT
+    #     beam = [[simulate(['NT(S)', 'NT(NP)', 'NT(NP)', 'SHIFT'])],  # can reduce
+    #             [simulate(['NT(NP)', 'NT(NP)', 'SHIFT']),  # can reduce
+    #              simulate(['NT(NP)', 'SHIFT', 'NT(VP)'])]]  # cannot reduce
+    #     successors, forced_completion_successors = model.get_successors(x, 0, beam, 12, 2)
+    #     self.assertEqual([len(s) for s in forced_completion_successors], [1, 2])
+    #     self.assertEqual([len(s) for s in successors], [6, 6+5])
 
-        # only reduce after shifting all
-        beam = [[simulate(['NT(S)', 'SHIFT', 'SHIFT', 'SHIFT'])],  # can finish
-                [simulate(['NT(NP)', 'NT(NP)', 'SHIFT', 'SHIFT', 'SHIFT']),  # cannot finish
-                 simulate(['NT(NP)', 'SHIFT', 'NT(VP)', 'SHIFT', 'SHIFT'])]]  # cannot finish
-        successors, forced_completion_successors = model.get_successors(x, 3, beam, 12, 2)
-        self.assertEqual([len(s) for s in forced_completion_successors], [1, 0])
-        self.assertEqual([len(s) for s in successors], [1, 2])
+    #     # only reduce after shifting all
+    #     beam = [[simulate(['NT(S)', 'SHIFT', 'SHIFT', 'SHIFT'])],  # can finish
+    #             [simulate(['NT(NP)', 'NT(NP)', 'SHIFT', 'SHIFT', 'SHIFT']),  # cannot finish
+    #              simulate(['NT(NP)', 'SHIFT', 'NT(VP)', 'SHIFT', 'SHIFT'])]]  # cannot finish
+    #     successors, forced_completion_successors = model.get_successors(x, 3, beam, 12, 2)
+    #     self.assertEqual([len(s) for s in forced_completion_successors], [1, 0])
+    #     self.assertEqual([len(s) for s in successors], [1, 2])
 
-    def test_update_stack_rnn(self):
-        model = self._get_simple_top_down_model()
-        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        initial_beam = model.initial_beam(x)
+    # def test_update_stack_rnn(self):
+    #     model = self._get_simple_top_down_model()
+    #     x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+    #     initial_beam = model.initial_beam(x)
 
-        def simulate(actions):
-            return self._simulate_beam_item(
-                initial_beam[0][0], actions, model.action_dict, model.w_dim, avoid_last_stack_update=True)
+    #     def simulate(actions):
+    #         return self._simulate_beam_item(
+    #             initial_beam[0][0], actions, model.action_dict, model.w_dim, avoid_last_stack_update=True)
 
-        items = [simulate(['NT(S)', 'NT(NP)', 'SHIFT']),
-                 simulate(['NT(S)', 'NT(NP)', 'SHIFT', 'SHIFT', 'REDUCE']),
-                 simulate(['NT(S)', 'NT(NP)', 'NT(VP)', 'SHIFT', 'REDUCE']),
-                 simulate(['NT(S)', 'NT(NP)', 'NT(VP)'])]
+    #     items = [simulate(['NT(S)', 'NT(NP)', 'SHIFT']),
+    #              simulate(['NT(S)', 'NT(NP)', 'SHIFT', 'SHIFT', 'REDUCE']),
+    #              simulate(['NT(S)', 'NT(NP)', 'NT(VP)', 'SHIFT', 'REDUCE']),
+    #              simulate(['NT(S)', 'NT(NP)', 'NT(VP)'])]
 
-        def test_state(state, pointer, len_stack, nopen_parens,
-                       ncons_nts, nt_index, nt_ids):
-            self.assertEqual(state.pointer, pointer)
-            self.assertEqual(len(state.stack), len_stack)
-            self.assertEqual(len(state.stack_trees), len_stack-1)
-            self.assertEqual(state.nopen_parens, nopen_parens)
-            self.assertEqual(state.ncons_nts, ncons_nts)
-            self.assertEqual(state.nt_index, nt_index)
-            self.assertEqual(state.nt_ids, nt_ids)
+    #     def test_state(state, pointer, len_stack, nopen_parens,
+    #                    ncons_nts, nt_index, nt_ids):
+    #         self.assertEqual(state.pointer, pointer)
+    #         self.assertEqual(len(state.stack), len_stack)
+    #         self.assertEqual(len(state.stack_trees), len_stack-1)
+    #         self.assertEqual(state.nopen_parens, nopen_parens)
+    #         self.assertEqual(state.ncons_nts, ncons_nts)
+    #         self.assertEqual(state.nt_index, nt_index)
+    #         self.assertEqual(state.nt_ids, nt_ids)
 
-        states = [item.state for item in items]
-        word_vecs = model.emb(x)
-        model.update_stack_rnn(items, states, word_vecs, [0, 0, 1, 1])
-        test_state(states[0], 1, 4, 2, 0, [1, 2], [0, 1])
-        test_state(states[1], 2, 3, 1, 0, [1], [0])
-        test_state(states[2], 1, 4, 2, 0, [1, 2], [0, 1])
-        test_state(states[3], 0, 4, 3, 3, [1, 2, 3], [0, 1, 2])
+    #     states = [item.state for item in items]
+    #     word_vecs = model.emb(x)
+    #     model.update_stack_rnn(items, states, word_vecs, [0, 0, 1, 1])
+    #     test_state(states[0], 1, 4, 2, 0, [1, 2], [0, 1])
+    #     test_state(states[1], 2, 3, 1, 0, [1], [0])
+    #     test_state(states[2], 1, 4, 2, 0, [1, 2], [0, 1])
+    #     test_state(states[3], 0, 4, 3, 3, [1, 2, 3], [0, 1, 2])
 
-    def test_beam_search(self):
-        model = self._get_simple_top_down_model()
-        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+    # def test_beam_search(self):
+    #     model = self._get_simple_top_down_model()
+    #     x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+    #     parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
 
-        self.assertEqual(len(parses), 2)
-        self.assertEqual(len(parses[0]), 5)
+    #     self.assertEqual(len(parses), 2)
+    #     self.assertEqual(len(parses[0]), 5)
 
-        paths = set([tuple(parse) for parse, score in parses[0]])
-        self.assertEqual(len(paths), 5)
+    #     paths = set([tuple(parse) for parse, score in parses[0]])
+    #     self.assertEqual(len(paths), 5)
 
-        for parse, score in parses[0]:
-            print([model.action_dict.i2a[action] for action in parse])
-        print(surprisals[0])
-        self.assertEqual([len(s) for s in surprisals], [3, 3])
-        self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+    #     for parse, score in parses[0]:
+    #         print([model.action_dict.i2a[action] for action in parse])
+    #     print(surprisals[0])
+    #     self.assertEqual([len(s) for s in surprisals], [3, 3])
+    #     self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
     def assertTensorAlmostEqual(self, x, y):
         self.assertIsNone(assert_almost_equal(x.cpu().detach().numpy(), y.cpu().detach().numpy()))

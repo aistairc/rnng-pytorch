@@ -38,7 +38,7 @@ parser.add_argument('--dropout', default=0.5, type=float, help='dropout rate')
 parser.add_argument('--composition', default='lstm', choices=['lstm', 'attention'],
                     help='lstm: original lstm composition; attention: gated attention introduced in Kuncoro et al. (2017).')
 # Optimization options
-parser.add_argument('--random_unk', default=True, type=bool, help='If True, randomly replace a token to <unk> on training sentences.')
+parser.add_argument('--no_random_unk', action='store_true', help='Prohibit to randomly replace a token to <unk> on training sentences (in default, randomly replace).')
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--save_path', default='rnng.pt', help='where to save the data')
 parser.add_argument('--num_epochs', default=18, type=int, help='number of training epochs')
@@ -54,9 +54,10 @@ parser.add_argument('--seed', default=3435, type=int, help='random seed')
 parser.add_argument('--print_every', type=int, default=500, help='print stats after this many batches')
 
 def main(args):
+  logger.info('Args: {}'.format(args))
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
-  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=args.random_unk)
+  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=not args.no_random_unk)
   vocab = train_data.vocab
   action_dict = train_data.action_dict
   val_data = Dataset.from_json(args.val_file, args.batch_size, vocab, action_dict)

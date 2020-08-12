@@ -436,14 +436,13 @@ class LSTMComposition(nn.Module):
     return self.output(c), None, None
 
 class AttentionComposition(nn.Module):
-  def __init__(self, w_dim, h_dim, num_labels = 10):
+  def __init__(self, w_dim, num_labels = 10):
     super(AttentionComposition, self).__init__()
     self.w_dim = w_dim
-    self.h_dim = h_dim
     self.num_labels = num_labels
 
     # self.V = nn.Bilinear(w_dim, h_dim+w_dim, )
-    self.V = nn.Linear(w_dim, h_dim+w_dim, bias=False)
+    self.V = nn.Linear(w_dim, 2*w_dim, bias=False)
     self.nt_emb = nn.Embedding(num_labels, w_dim)  # o_nt in the Kuncoro et al. (2017)
     self.nt_emb2 = nn.Embedding(num_labels, w_dim)  # t_nt in the Kuncoro et al. (2017)
     self.gate = nn.Sequential(nn.Linear(w_dim*2, w_dim), nn.Sigmoid())
@@ -492,17 +491,16 @@ class TopDownRNNG(nn.Module):
       nn.Embedding(vocab, w_dim, padding_idx=padding_idx), self.dropout)
     self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), w_dim), self.dropout)
     self.stack_rnn = SeqLSTM(w_dim, h_dim, num_layers=num_layers, dropout=dropout)
-    self.stack_to_hidden = nn.Sequential(self.dropout, nn.Linear(h_dim, h_dim), nn.ReLU())
-    self.vocab_mlp = nn.Linear(h_dim, vocab)
+    self.stack_to_hidden = nn.Sequential(self.dropout, nn.Linear(h_dim, w_dim), nn.ReLU())
+    self.vocab_mlp = nn.Linear(w_dim, vocab)
     self.num_layers = num_layers
     self.num_actions = action_dict.num_actions()  # num_labels + 2
-    self.action_mlp = nn.Linear(h_dim, self.num_actions)
+    self.action_mlp = nn.Linear(w_dim, self.num_actions)
     self.w_dim = w_dim
     self.h_dim = h_dim
-    if w_dim == h_dim:
-      self.vocab_mlp.weight = self.emb[0].weight
+    self.vocab_mlp.weight = self.emb[0].weight
 
-    self.composition = (AttentionComposition(w_dim, h_dim, self.action_dict.num_nts())
+    self.composition = (AttentionComposition(w_dim, self.action_dict.num_nts())
                         if attention_composition else
                         LSTMComposition(w_dim, dropout))
     self.max_open_nts = max_open_nts
