@@ -30,6 +30,9 @@ class Vocabulary(object):
     self.w2c = dict(w2c_list)
     self.i2c = dict([(self.w2i[w], c) for w, c in self.w2c.items()])
 
+    if self.unkmethod == 'unk':
+      self.unk_id = self.w2i[self.unktoken]
+
   def to_unk(self, w):
     if self.unkmethod == 'unk':
       return self.unktoken
@@ -43,7 +46,7 @@ class Vocabulary(object):
       if 1 <= w_id < 1+len(self.specials):
         return w_id
       else:
-        return self.get_id(self.i2w[w_id])
+        return self.get_id(berkeley_unk_conv(self.i2w[w_id]))
 
   def size(self):
     return len(self.i2w)
@@ -125,7 +128,7 @@ class Sentence(object):
 
   def random_unked(self, vocab):
     def unkify_rand(w_id):
-      c = vocab. get_count_from_id(w_id)
+      c = vocab.get_count_from_id(w_id)
       if c == 0 or (np.random.rand() < 1 / (1 + c)):
         return vocab.to_unk_id(w_id)
       else:
