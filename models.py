@@ -740,7 +740,7 @@ class TopDownRNNG(nn.Module):
         shift_in_successors = (action_id[:num_beams] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
         if shift_in_successors < shift_size:
           # find and add additional forced shift successors
-          additional = ((action_id[num_beams:] == self.action_dict.a2i['SHIFT'])
+          additional = ((action_id[beam_size:] == self.action_dict.a2i['SHIFT'])
                         .nonzero()[:shift_size - shift_in_successors].squeeze(1)).cpu()
           additional += num_beams  # add offset
           successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
