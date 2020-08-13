@@ -222,8 +222,8 @@ def main(arguments):
                                                 type=int, default=0)
     parser.add_argument('--unkmethod', help="How to replace an unknown token.", choices=['unk', 'berkeleyrule'],
                         default='unk')
-    parser.add_argument('--lowercase', help="Lower case", type=bool, default=False)
-    parser.add_argument('--replace_num', help="Replace numbers with N", type=bool, default=False)
+    parser.add_argument('--lowercase', help="Lower case", action='store_true')
+    parser.add_argument('--replace_num', help="Replace numbers with N", action='store_true')
     parser.add_argument('--trainfile', help="Path to training data.", required=True)
     parser.add_argument('--valfile', help="Path to validation data.", required=True)
     parser.add_argument('--testfile', help="Path to test validation data.", required=True)
