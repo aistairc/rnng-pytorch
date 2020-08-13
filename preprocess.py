@@ -165,6 +165,7 @@ def get_data(args):
                 sent = [utils.clean_number(w) for w in sent]
             sent_ids = [vocab.get_id(t) for t in sent]
             action_ids = action_dict.to_id(action)
+            sent = [vocab.i2w[w_i] for w_i in sent_ids]
             sentences.append(Sentence(orig_sent, sent, sent_ids, tags, action, action_ids, tree))
             sent_id += 1
             if sent_id % 100000 == 0:
