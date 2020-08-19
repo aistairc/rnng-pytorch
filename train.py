@@ -13,6 +13,7 @@ from torch import cuda
 import torch.nn as nn
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
+from torch.utils.tensorboard import SummaryWriter
 
 import torch.nn.functional as F
 import numpy as np
@@ -38,11 +39,13 @@ parser.add_argument('--dropout', default=0.5, type=float, help='dropout rate')
 parser.add_argument('--composition', default='lstm', choices=['lstm', 'attention'],
                     help='lstm: original lstm composition; attention: gated attention introduced in Kuncoro et al. (2017).')
 # Optimization options
+parser.add_argument('--optimizer', choices=['sgd', 'adam'], help='Which optimizer to use.')
 parser.add_argument('--no_random_unk', action='store_true', help='Prohibit to randomly replace a token to <unk> on training sentences (in default, randomly replace).')
 parser.add_argument('--batch_size', type=int, default=16)
-parser.add_argument('--save_path', default='rnng.pt', help='where to save the data')
+parser.add_argument('--save_path', default='rnng.pt', help='where to save the best model')
 parser.add_argument('--num_epochs', default=18, type=int, help='number of training epochs')
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
+parser.add_argument('--decay_cond_epochs', default=1, type=int, help='decay learning rate if loss does not improve conscutively this many steps')
 #parser.add_argument('--mode', default='unsupervised', type=str, choices=['unsupervised', 'supervised'])
 parser.add_argument('--lr', default=1, type=float, help='starting learning rate')
 parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action'])
@@ -52,9 +55,29 @@ parser.add_argument('--max_grad_norm', default=5, type=float, help='gradient cli
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int, help='random seed')
 parser.add_argument('--print_every', type=int, default=500, help='print stats after this many batches')
+parser.add_argument('--tensorboard_log_dir', default='',
+                    help='If not empty, tensor board summaries are recorded on the directory `tensor_board_log_dir/save_path`')
+
+class TensorBoardLogger(object):
+  def __init__(self, args):
+    if len(args.tensorboard_log_dir) > 0:
+      log_dir = os.path.join(args.tensorboard_log_dir, args.save_path)
+      self.writer = SummaryWriter(log_dir = log_dir)
+      self.global_step = 0
+    else:
+      self.writer = None
+
+  def write(self, kvs = {}, step = None):
+    if self.writer is not None:
+      if step is None:
+        step = self.global_step
+        self.global_step += 1
+      for k, v in kvs.items():
+        self.writer.add_scalar(k, v, step)
 
 def main(args):
   logger.info('Args: {}'.format(args))
+  tb = TensorBoardLogger(args)
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
   torch.cuda.manual_seed(args.seed)
@@ -86,16 +109,18 @@ def main(args):
     model = checkpoint['model']
   logger.info("model architecture")
   logger.info(model)
-  optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+  if args.optimizer == 'sgd':
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+  else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    args.min_epochs = args.num_epochs
   model.train()
   model.cuda()
 
   epoch = 0
   decay= 0
   best_val_loss = 5e10
-  # best_val_ppl, best_val_f1 = eval(val_data, model, samples = args.mc_samples,
-  #                                  count_eos_ppl = args.count_eos_ppl)
-  # all_stats = [[0., 0., 0.]] #true pos, false pos, false neg for f1 calc
+  val_losses = []
   while epoch < args.num_epochs:
     start_time = time.time()
     epoch += 1
@@ -137,19 +162,22 @@ def main(args):
         ppl = np.exp((-total_a_ll - total_w_ll) / (num_actions + num_words))
         ll_diff =  total_ll - prev_ll
         prev_ll = total_ll
+        action_ppl = np.exp(-total_a_ll / num_actions)
+        word_ppl = np.exp(-total_w_ll / num_words)
         logger.info('Epoch: {}, Batch: {}/{}, LR: {:.4f}, '
                     'ActionPPL: {:.2f}, WordPPL: {:.2f}, '
                     'PPL: {:2f}, LL: {}, '
                     '|Param|: {:.2f}, Throughput: {:.2f} examples/sec'.format(
                       epoch, b, len(train_data), args.lr,
-                      np.exp(-total_a_ll / num_actions),
-                      np.exp(-total_w_ll / num_words),
+                      action_ppl, word_ppl,
                       ppl, -ll_diff,
                       param_norm, num_sents / (time.time() - start_time)
                     ))
+        tb.write({'Train ppl': ppl, 'Train word ppl': word_ppl, 'lr': args.lr})
     logger.info('--------------------------------')
     logger.info('Checking validation perplexity...')
-    val_loss, val_ppl = eval_action_ppl(val_data, model)
+    val_loss, val_ppl, val_action_ppl, val_word_ppl = eval_action_ppl(val_data, model)
+    tb.write({'Valid ppl': val_ppl, 'Valid action ppl': val_action_ppl, 'Valid word ppl': val_word_ppl}, epoch)
     logger.info('--------------------------------')
     if val_loss < best_val_loss:
       best_val_loss = val_loss
@@ -163,13 +191,15 @@ def main(args):
       logger.info('Saving checkpoint to {}'.format(args.save_path))
       torch.save(checkpoint, args.save_path)
       model.cuda()
-    else:
-      if epoch > args.min_epochs:
-        decay = 1
-      if decay == 1:
-        args.lr = args.decay*args.lr
-        for param_group in optimizer.param_groups:
-          param_group['lr'] = args.lr
+
+    def consecutive_increase(target_losses):
+      return all(target_losses[i] < target_losses[i+1] for i in range(0, len(target_losses)-1))
+
+    val_losses.append(val_loss)
+    if epoch > args.min_epochs and consecutive_increase(val_losses[-args.decay_cond_epochs-1:]):
+      args.lr = args.decay*args.lr
+      for param_group in optimizer.param_groups:
+        param_group['lr'] = args.lr
   logger.info("Finished training!")
 
 def eval_action_ppl(data, model):
@@ -194,11 +224,13 @@ def eval_action_ppl(data, model):
 
   ppl = np.exp((-total_a_ll - total_w_ll) / (num_actions + num_words))
   loss = -(total_a_ll + total_w_ll)
+  action_ppl = np.exp(-total_a_ll / num_actions)
+  word_ppl = np.exp(-total_w_ll / num_words)
   logger.info('PPL: {:2f}, Loss: {:2f}, ActionPPL: {:2f}, WordPPL: {:2f}'.format(
-    ppl, loss, np.exp(-total_a_ll / num_actions), np.exp(-total_w_ll / num_words)))
+    ppl, loss, action_ppl, word_ppl))
 
   model.train()
-  return loss, ppl
+  return loss, ppl, action_ppl, word_ppl
 
 if __name__ == '__main__':
   args = parser.parse_args()
