@@ -5,7 +5,7 @@ import pickle
 from collections import defaultdict
 import json
 from utils import pad_items, clean_number, berkeley_unk_conv
-from action_dict import TopDownActionDict
+from action_dict import TopDownActionDict, InOrderActionDict
 
 class Vocabulary(object):
   """
@@ -107,23 +107,30 @@ class Vocabulary(object):
                       d['specials'])
 
 class Sentence(object):
-  def __init__(self, orig_tokens, tokens, token_ids, tags, actions=[], action_ids=[], tree_str=None):
+  def __init__(self, orig_tokens, tokens, token_ids, tags,
+               actions=None, action_ids=None, tree_str=None):
     self.orig_tokens = orig_tokens
     self.tokens = tokens
     self.token_ids = token_ids
     self.tags = tags
-    self.actions = actions
-    self.action_ids = action_ids
+    self.actions = actions or []
+    self.action_ids = action_ids or []
     self.tree_str = tree_str  # original annotation
 
   @staticmethod
-  def from_json(j):
+  def from_json(j, oracle='top_down'):
+    if oracle == 'top_down':
+      actions = j.get('actions', [])
+      action_ids = j.get('action_ids', [])
+    elif oracle == 'in_order':
+      actions = j.get('in_order_actions', [])
+      action_ids = j.get('in_order_action_ids', [])
     return Sentence(j['orig_tokens'],
                     j['tokens'],
                     j['token_ids'],
                     j.get('tags', []),
-                    j.get('actions', []),
-                    j.get('action_ids', []),
+                    actions,
+                    action_ids,
                     j.get('tree_str', None))
 
   def random_unked(self, vocab):
@@ -155,7 +162,8 @@ class Dataset(object):
     self.num_batches = self.get_num_batches()
 
   @staticmethod
-  def from_json(data_file, batch_size, vocab=None, action_dict=None, random_unk=False):
+  def from_json(data_file, batch_size, vocab=None, action_dict=None, random_unk=False,
+                oracle='top_down'):
     """If vocab and action_dict are provided, they are not loaded from data_file.
     This is for sharing these across train/valid/test sents.
 
@@ -163,10 +171,16 @@ class Dataset(object):
     inverse proportional to the frequency in the training data.
     TODO: add custom unkifier?
     """
+    def new_action_dict(nonterminals):
+      if oracle == 'top_down':
+        return TopDownActionDict(nonterminals)
+      elif oracle == 'in_order':
+        return InOrderActionDict(nonterminals)
+
     j = json.load(open(data_file))
-    sents = [Sentence.from_json(s) for s in j['sentences']]
+    sents = [Sentence.from_json(s, oracle) for s in j['sentences']]
     vocab = vocab or Vocabulary.from_data_json(j)
-    action_dict = action_dict or TopDownActionDict(j['nonterminals'])
+    action_dict = action_dict or new_action_dict(j['nonterminals'])
 
     return Dataset(sents, batch_size, vocab, action_dict, random_unk, j['args'])
 

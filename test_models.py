@@ -3,7 +3,8 @@ from numpy.testing import assert_array_equal, assert_almost_equal, assert_allclo
 import torch
 
 from models import *
-from action_dict import TopDownActionDict
+from in_order_models import *
+from action_dict import TopDownActionDict, InOrderActionDict
 
 class TestModels(unittest.TestCase):
 
@@ -271,12 +272,34 @@ class TestModels(unittest.TestCase):
             self.assertEqual([len(s) for s in surprisals], [3, 3])
             self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
+    def test_beam_search_in_order(self):
+        with torch.no_grad():
+            model = self._get_simple_in_order_model()
+            x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+            parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+
+            self.assertEqual(len(parses), 2)
+            self.assertEqual(len(parses[0]), 5)
+
+            paths = set([tuple(parse) for parse, score in parses[0]])
+            self.assertEqual(len(paths), 5)
+
+            for parse, score in parses[0]:
+                print([model.action_dict.i2a[action] for action in parse])
+            print(surprisals[0])
+            self.assertEqual([len(s) for s in surprisals], [3, 3])
+            self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
     def assertTensorAlmostEqual(self, x, y):
         self.assertIsNone(assert_almost_equal(x.cpu().detach().numpy(), y.cpu().detach().numpy()))
 
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2):
         a_dict = TopDownActionDict(['S', 'NP', 'VP', 'PP'])
         return TopDownRNNG(a_dict, vocab=vocab, w_dim=w_dim, h_dim=h_dim, num_layers=num_layers)
+
+    def _get_simple_in_order_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2):
+        a_dict = InOrderActionDict(['S', 'NP', 'VP', 'PP'])
+        return InOrderRNNG(a_dict, vocab=vocab, w_dim=w_dim, h_dim=h_dim, num_layers=num_layers)
 
     def _trees_to_actions(self, trees):
         def conv(a):
@@ -293,11 +316,11 @@ class TestModels(unittest.TestCase):
         def rand_new_stack_top():
             h_dim = item.state.stack[0][0][0].size(0)
             layers = len(item.state.stack[0])
-            return [([torch.rand(h_dim)], [torch.rand(h_dim)]) for _ in range(layers)]
+            return [[torch.rand(h_dim), torch.rand(h_dim)] for _ in range(layers)]
         def rand_new_tree_elem():
-            return [torch.rand(w_dim)]
+            return torch.rand(w_dim)
         def update_stack_by_rand(state):
-            state.update_stack(rand_new_stack_top(), rand_new_tree_elem(), 0)
+            state.update_stack(rand_new_stack_top(), rand_new_tree_elem())
 
         _item = item
         for i, a in enumerate(actions):

@@ -16,7 +16,7 @@ import re
 import json
 
 from data import Sentence, Vocabulary
-from action_dict import TopDownActionDict
+from action_dict import TopDownActionDict, InOrderActionDict
 
 def is_next_open_bracket(line, start_idx):
     for char in line[(start_idx + 1):]:
@@ -95,7 +95,7 @@ def get_actions(line):
              i += 1
              while line_strip[i] != ')' and line_strip[i] != '(':
                  i += 1
-    assert i == max_idx  
+    assert i == max_idx
     return output_actions
 
 def pad(ls, length, symbol):
@@ -146,27 +146,40 @@ def get_data(args):
         return nts
 
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
-                outfile, vocab, action_dict, apply_length_filter=True):
+                outfile, vocab, action_dict, io_action_dict, apply_length_filter=True):
         dropped = 0
         sent_id = 0
         sentences = []
         for tree in open(textfile, 'r'):
             tree = tree.strip()
-            action = get_actions(tree)
-            tags, sent, sent_lower = get_tags_tokens_lowercase(tree)
-            orig_sent = sent[:]
-            assert(len(tags) == len(sent))
+            top_down_actions = get_actions(tree)
+            in_order_actions = utils.get_in_order_actions(tree)
+            tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
+            orig_tokens = tokens[:]
+            assert(len(tags) == len(tokens))
             if lowercase:
-                sent = sent_lower
-            if (len(sent) > seqlength and apply_length_filter) or len(sent) < minseqlength:
+                tokens = tokens_lower
+            if (len(tokens) > seqlength and apply_length_filter) or len(tokens) < minseqlength:
                 dropped += 1
                 continue
             if replace_num:
-                sent = [utils.clean_number(w) for w in sent]
-            sent_ids = [vocab.get_id(t) for t in sent]
-            action_ids = action_dict.to_id(action)
-            sent = [vocab.i2w[w_i] for w_i in sent_ids]
-            sentences.append(Sentence(orig_sent, sent, sent_ids, tags, action, action_ids, tree))
+                tokens = [utils.clean_number(w) for w in tokens]
+            token_ids = [vocab.get_id(t) for t in tokens]
+            top_down_action_ids = action_dict.to_id(top_down_actions)
+            in_order_action_ids = io_action_dict.to_id(in_order_actions)
+            assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
+            conved_tokens = [vocab.i2w[w_i] for w_i in token_ids]
+            sentences.append({
+                'orig_tokens': orig_tokens,
+                'tokens': conved_tokens,
+                'token_ids': token_ids,
+                'tags': tags,
+                'actions': top_down_actions,
+                'action_ids': top_down_action_ids,
+                'in_order_actions': in_order_actions,
+                'in_order_action_ids': in_order_action_ids,
+                'tree_str': tree
+            })
             sent_id += 1
             if sent_id % 100000 == 0:
                 print("{} sentences processed".format(sent_id))
@@ -174,7 +187,7 @@ def get_data(args):
         print(len(sentences))
 
         # Write output
-        f = {"sentences": [s.to_dict() for s in sentences],
+        f = {"sentences": sentences,
              "vocab": vocab.to_json_dict(),
              "nonterminals": nonterminals,
              "pad_token": pad,
@@ -188,6 +201,7 @@ def get_data(args):
     print("First pass through data to get nonterminals...")
     nonterminals = get_nonterminals([args.trainfile, args.valfile])
     action_dict = TopDownActionDict(nonterminals)
+    io_action_dict = InOrderActionDict(nonterminals)
 
     if args.vocabfile != '':
         print('Loading pre-specified source vocab from ' + args.vocabfile)
@@ -202,13 +216,13 @@ def get_data(args):
     print("Vocab size: {}".format(len(vocab.i2w)))
     convert(args.testfile, args.lowercase, args.replace_num,
             0, args.minseqlength, args.outputfile + "-test.json",
-            vocab, action_dict, 0)
+            vocab, action_dict, io_action_dict, 0)
     convert(args.valfile, args.lowercase, args.replace_num,
             args.seqlength, args.minseqlength, args.outputfile + "-val.json",
-            vocab, action_dict, 0)
+            vocab, action_dict, io_action_dict, 0)
     convert(args.trainfile, args.lowercase, args.replace_num,
             args.seqlength,  args.minseqlength, args.outputfile + "-train.json",
-            vocab, action_dict, 1)
+            vocab, action_dict, io_action_dict, 1)
 
 def main(arguments):
     parser = argparse.ArgumentParser(

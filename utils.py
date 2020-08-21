@@ -3,6 +3,28 @@ import numpy as np
 import itertools
 import random
 import torch.nn.functional as F
+from nltk import Tree
+
+def get_in_order_actions(line):
+  def get_actions_recur(tree, actions=[]):
+    if len(tree) == 1:
+      if isinstance(tree[0], str):  # preterminal
+        actions.append('SHIFT')
+      else:  # unary
+        actions = get_actions_recur(tree[0], actions)
+        actions.append('NT({})'.format(tree.label()))
+        actions.append('REDUCE')
+    else:  # multiple children
+      left_corner, others = tree[0], tree[1:]
+      actions = get_actions_recur(left_corner, actions)
+      actions.append('NT({})'.format(tree.label()))
+      for c in others:
+        actions = get_actions_recur(c, actions)
+      actions.append('REDUCE')
+    return actions
+
+  tree = Tree.fromstring(line.strip())
+  return get_actions_recur(tree) + ['FINISH']
 
 def get_actions(tree, SHIFT = 0, REDUCE = 1, OPEN='(', CLOSE=')'):
   #input tree in bracket form: ((A B) (C D))
@@ -29,7 +51,7 @@ def get_actions(tree, SHIFT = 0, REDUCE = 1, OPEN='(', CLOSE=')'):
   assert(num_shift == num_reduce + 1)
   return actions
 
-    
+
 def get_tree(actions, sent = None, SHIFT = 0, REDUCE = 1):
   #input action and sent (lists), e.g. S S R S S R R, A B C D
   #output tree ((A B) (C D))

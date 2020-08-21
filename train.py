@@ -21,6 +21,7 @@ import time
 import logging
 from data import Dataset
 from models import TopDownRNNG
+from in_order_models import InOrderRNNG
 from utils import *
 
 logger = logging.getLogger('train')
@@ -32,6 +33,7 @@ parser.add_argument('--train_file', default='data/ptb-no-unk-train.json')
 parser.add_argument('--val_file', default='data/ptb-no-unk-val.json')
 parser.add_argument('--train_from', default='')
 # Model options
+parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
 parser.add_argument('--w_dim', default=650, type=int, help='input/output word dimension')
 parser.add_argument('--h_dim', default=650, type=int, help='LSTM hidden dimension')
 parser.add_argument('--num_layers', default=2, type=int, help='number of layers in LM and the stack LSTM (for RNNG)')
@@ -75,16 +77,37 @@ class TensorBoardLogger(object):
       for k, v in kvs.items():
         self.writer.add_scalar(k, v, step)
 
+def create_model(args, action_dict, vocab):
+  model_args = {'action_dict': action_dict,
+                'vocab': vocab.size(),
+                'padding_idx': vocab.padding_idx,
+                'w_dim': args.w_dim,
+                'h_dim': args.h_dim,
+                'num_layers': args.num_layers,
+                'dropout': args.dropout,
+                'attention_composition': args.composition == 'attention'}
+
+  if args.strategy == 'top_down':
+    model = TopDownRNNG(**model_args)
+  elif args.strategy == 'in_order':
+    model = InOrderRNNG(**model_args)
+  if args.param_init > 0:
+    for param in model.parameters():
+      param.data.uniform_(-args.param_init, args.param_init)
+  return model
+
 def main(args):
   logger.info('Args: {}'.format(args))
   tb = TensorBoardLogger(args)
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
   torch.cuda.manual_seed(args.seed)
-  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=not args.no_random_unk)
+  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=not args.no_random_unk,
+                                 oracle=args.strategy)
   vocab = train_data.vocab
   action_dict = train_data.action_dict
-  val_data = Dataset.from_json(args.val_file, args.batch_size, vocab, action_dict)
+  val_data = Dataset.from_json(args.val_file, args.batch_size, vocab, action_dict,
+                               oracle=args.strategy)
   vocab_size = int(train_data.vocab_size)
   logger.info('Train: %d sents / %d batches, Val: %d sents / %d batches' %
               (len(train_data.sents), len(train_data), len(val_data.sents),
@@ -92,17 +115,7 @@ def main(args):
   logger.info('Vocab size: %d' % vocab_size)
   cuda.set_device(args.gpu)
   if args.train_from == '':
-    model = TopDownRNNG(train_data.action_dict,
-                        vocab = vocab_size,
-                        padding_idx = vocab.padding_idx,
-                        w_dim = args.w_dim,
-                        h_dim = args.h_dim,
-                        num_layers = args.num_layers,
-                        dropout = args.dropout,
-                        attention_composition = args.composition == 'attention')
-    if args.param_init > 0:
-      for param in model.parameters():
-        param.data.uniform_(-args.param_init, args.param_init)
+    model = create_model(args, action_dict, vocab)
   else:
     logger.info('loading model from ' + args.train_from)
     checkpoint = torch.load(args.train_from)

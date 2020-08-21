@@ -462,12 +462,8 @@ class AttentionComposition(nn.Module):
 
     return c, attn, g
 
-# class AbstractRNNG(nn.Module):
-#   def __init__(self):
-#     super(AbstractRNNG, self).__init__()
-
 class TopDownRNNG(nn.Module):
-  def __init__(self, action_dict,  # need to define a class
+  def __init__(self, action_dict,
                vocab = 100,
                padding_idx = 0,
                w_dim = 20,
@@ -592,6 +588,7 @@ class TopDownRNNG(nn.Module):
           forced_completions[i] += c
 
         all_items, batch_idx = self._flatten_items(new_beam)
+
         self.update_stack_rnn_beam(all_items, word_vecs, batch_idx, pointer)
 
         beam_lengths = [len(batch_beam) for batch_beam in new_beam]
@@ -625,12 +622,12 @@ class TopDownRNNG(nn.Module):
     return parses, surprisals
 
   def initial_beam(self, x):
-    initial_hs = self._initial_hs(x)
-    return [[BeamItem.from_initial_stack(h)] for h in initial_hs]
+    states = self.initial_states(x)
+    return [[BeamItem.from_initial_state(state)] for state in states]
 
   def initial_states(self, x, initial_stack = None):
     initial_hs = self._initial_hs(x, initial_stack)
-    return [State.from_initial_stack(h) for h in initial_hs]
+    return [TopDownState.from_initial_stack(h) for h in initial_hs]
 
   def _initial_hs(self, x, initial_stack = None):
     initial_stack = initial_stack or self.get_initial_stack(x)
@@ -668,6 +665,7 @@ class TopDownRNNG(nn.Module):
 
     action_logit = self.action_mlp(hiddens)
     action_logit[action_mask != 1] = -float('inf')
+
     log_probs = F.log_softmax(action_logit)  # (total beam size, num_actions)
 
     if next_x is not None:  # shift is valid for next action
@@ -680,7 +678,6 @@ class TopDownRNNG(nn.Module):
     return log_probs
 
   def valid_action_mask(self, items, sent_len):
-    #mask = items[0].state.stack[0][0][0].new_ones(len(items), self.num_actions, dtype=torch.uint8)
     mask = torch.ones((len(items), self.num_actions), dtype=torch.uint8)
     mask[:, self.action_dict.padding_idx] = 0
     for b, item in enumerate(items):
@@ -743,19 +740,22 @@ class TopDownRNNG(nn.Module):
           additional = ((action_id[beam_size:] == self.action_dict.a2i['SHIFT'])
                         .nonzero()[:shift_size - shift_in_successors].squeeze(1)).cpu()
           additional += beam_size  # add offset
+          assert all(action_id_np[i] == self.action_dict.a2i['SHIFT'] for i in additional)
           successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
                                 for i in additional]
           forced_completions[batch] = additional.size(0)
       else:
-        # Only allowed action is reduce, so checking whether the state can be finished suffices.
-        finish_reduces = [beam[batch][b].state.can_finish_by_reduce() for (b, a, s)
-                          in successors[batch]]
-        if len(finish_reduces) < shift_size:
-          remain = shift_size - len(finish_reduces)
+        # At the end, save final actions.
+        finish_actions = [(b, a, s) for (b, a, s) in successors[batch]
+                          if self._is_last_action(a, beam[batch][b].state, True)]
+
+        if len(finish_actions) < shift_size:
+          remain = shift_size - len(finish_actions)
           additional = []
           for i in range(beam_size, len(beam_id_np)):
             b = beam_id_np[i]
-            if beam[batch][b].state.can_finish_by_reduce():
+            a = action_id_np[i]
+            if self._is_last_action(a, beam[batch][b].state, True):
               additional.append(i)
             if len(additional) >= remain:
               break
@@ -814,7 +814,7 @@ class TopDownRNNG(nn.Module):
       reduce_idx = reduces.cpu().numpy()
       reduce_states = [states[i] for i in reduce_idx]
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
-      reduce_context = self._collect_stack_top_h_beam(reduce_states)
+      reduce_context = self._collect_stack_top_h(reduce_states)
       reduce_context = self.stack_to_hidden(reduce_context)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
       new_stack_input[reduces] = new_child
@@ -829,7 +829,8 @@ class TopDownRNNG(nn.Module):
     new_stack_top = self.stack_rnn(new_stack_input, stack_top_context)
 
     for b in range(len(states)):
-      states[b].update_stack(new_stack_top, new_stack_input, b)
+      new_stack_top_b = [[layer[0][b], layer[1][b]] for layer in new_stack_top]
+      states[b].update_stack(new_stack_top_b, new_stack_input[b])
       states[b].do_action(actions[b].item(), self.action_dict)
 
   def update_beam_and_word_completed(self, beam, word_completed, items, beam_lengths, last_token=False):
@@ -838,14 +839,18 @@ class TopDownRNNG(nn.Module):
       beam[b] = []
       l = beam_lengths[b]
       for item in items[accum:accum+l]:
-        if (last_token and self.action_dict.is_reduce(item.action) and
-            item.state.nopen_parens == 0) or self.action_dict.is_shift(item.action):
+        if (self._is_last_action(item.action, item.state, last_token) or
+            self.action_dict.is_shift(item.action)):
           # Cases where shifting last+1 token should be pruned by action masking.
           word_completed[b].append(item)
         else:
           beam[b].append(item)
       accum += l
     assert accum == sum(beam_lengths)
+
+  def _is_last_action(self, action, state, shifted_all):
+    return (shifted_all and self.action_dict.is_reduce(action) and
+            state.nopen_parens == 0)
 
   def _flatten_items(self, items):
     flatten_items = []
@@ -890,14 +895,16 @@ class TopDownRNNG(nn.Module):
 
     return (children, ch_lengths, nt, nt_ids)
 
-  def _collect_stack_top_h_beam(self, states):
+  def _collect_stack_top_h(self, states):
     return torch.stack([state.stack[-1][-1][0] for state in states], 0)
 
-  def _collect_stack_top_context(self, states):
+  def _collect_stack_top_context(self, states, idx = None, offset = 1):
+    if idx is None:
+      idx = range(len(states))
     stack_h_all = []
     for l in range(self.num_layers):
-      h = [state.stack[-1][l][0] for state in states]
-      c = [state.stack[-1][l][1] for state in states]
+      h = [states[i].stack[-offset][l][0] for i in idx]
+      c = [states[i].stack[-offset][l][1] for i in idx]
       stack_h_all.append((torch.stack(h, 0), torch.stack(c, 0)))
     return stack_h_all
 
@@ -908,7 +915,7 @@ class TopDownRNNG(nn.Module):
       ll.append(torch.logsumexp(torch.tensor(scores), 0).item())
     return ll
 
-class State:
+class TopDownState:
   def __init__(self,
                pointer = 0,
                stack = None,
@@ -935,9 +942,9 @@ class State:
     stack_str = ' '.join(stack_str)
     return '{{[ {} ], pointer={}}}'.format(stack_str, self.pointer)
 
-  @staticmethod
-  def from_initial_stack(initial_stack_elem):
-    return State(stack=[initial_stack_elem])
+  @classmethod
+  def from_initial_stack(cls, initial_stack_elem):
+    return cls(stack=[initial_stack_elem])
 
   def can_finish_by_reduce(self):
     return self.nopen_parens == 1
@@ -946,8 +953,8 @@ class State:
     return self.pointer > 0 and self.nopen_parens == 0
 
   def copy(self):
-    return State(self.pointer, self.stack[:], self.stack_trees[:],
-                 self.nopen_parens, self.ncons_nts, self.nt_index[:], self.nt_ids[:])
+    return TopDownState(self.pointer, self.stack[:], self.stack_trees[:],
+                        self.nopen_parens, self.ncons_nts, self.nt_index[:], self.nt_ids[:])
 
   def do_action(self, a, action_dict):
     if action_dict.is_shift(a):
@@ -971,9 +978,9 @@ class State:
     self.stack_trees = self.stack_trees[:open_idx-1]
     return reduce_trees[0], reduce_trees[1:], nt_id
 
-  def update_stack(self, new_stack_top, new_tree_elem, b_i):
-    self.stack.append([[layer[0][b_i], layer[1][b_i]] for layer in new_stack_top])
-    self.stack_trees.append(new_tree_elem[b_i])
+  def update_stack(self, new_stack_top, new_tree_elem):
+    self.stack.append(new_stack_top)
+    self.stack_trees.append(new_tree_elem)
 
 class ActionPath:
   def __init__(self, prev=None, action=0, score=0.0):
@@ -1004,6 +1011,11 @@ class BeamItem:
     state = State.from_initial_stack(initial_stack_elem)
     path = ActionPath()  # initial action is 0 (pad)
     return BeamItem(state, path)
+
+  @staticmethod
+  def from_initial_state(initial_state):
+    path = ActionPath()  # initial action is 0 (pad)
+    return BeamItem(initial_state, path)
 
   def parse_actions(self):
     actions = []
