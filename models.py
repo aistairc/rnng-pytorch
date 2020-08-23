@@ -436,31 +436,40 @@ class LSTMComposition(nn.Module):
     return self.output(c), None, None
 
 class AttentionComposition(nn.Module):
-  def __init__(self, w_dim, num_labels = 10):
+  def __init__(self, w_dim, dropout, num_labels = 10):
     super(AttentionComposition, self).__init__()
     self.w_dim = w_dim
     self.num_labels = num_labels
+    self.dropout = nn.Dropout(dropout)
 
-    # self.V = nn.Bilinear(w_dim, h_dim+w_dim, )
-    self.V = nn.Linear(w_dim, 2*w_dim, bias=False)
+    self.rnn = nn.LSTM(w_dim, w_dim, bidirectional=True, batch_first=True)
+
+    self.V = nn.Linear(2*w_dim, 2*w_dim, bias=False)
     self.nt_emb = nn.Embedding(num_labels, w_dim)  # o_nt in the Kuncoro et al. (2017)
-    self.nt_emb2 = nn.Embedding(num_labels, w_dim)  # t_nt in the Kuncoro et al. (2017)
-    self.gate = nn.Sequential(nn.Linear(w_dim*2, w_dim), nn.Sigmoid())
+    self.nt_emb2 = nn.Sequential(nn.Embedding(num_labels, w_dim*2), self.dropout)  # t_nt in the Kuncoro et al. (2017)
+    self.gate = nn.Sequential(nn.Linear(w_dim*4, w_dim*2), nn.Sigmoid())
+    self.output = nn.Sequential(nn.Linear(w_dim*2, w_dim), nn.ReLU())
 
   def forward(self, children, ch_lengths, nt, nt_id, stack_state):  # children: (batch_size, n_children, w_dim)
-    rhs = torch.cat([self.nt_emb(nt_id), stack_state], dim=1) # (batch_size, h_dim+w_dim, 1)
-    logit = (self.V(children)*rhs.unsqueeze(1)).sum(-1)  # equivalent to bmm(self.V(children), rhs.unsqueeze(-1)).squeeze(-1)
+
+    packed = pack_padded_sequence(children, ch_lengths, batch_first=True, enforce_sorted=False)
+    h, _ = self.rnn(packed)
+    h, _ = pad_packed_sequence(h, batch_first=True)  # (batch, n_children, 2*w_dim)
+
+    rhs = torch.cat([self.nt_emb(nt_id), stack_state], dim=1) # (batch_size, w_dim*2, 1)
+    logit = (self.V(h)*rhs.unsqueeze(1)).sum(-1)  # equivalent to bmm(self.V(h), rhs.unsqueeze(-1)).squeeze(-1)
     len_mask = length_to_mask(ch_lengths)
     logit[len_mask != 1] = -float('inf')
     attn = F.softmax(logit)
-    weighted_child = (children*attn.unsqueeze(-1)).sum(1)
+    weighted_child = (h*attn.unsqueeze(-1)).sum(1)
+    weighted_child = self.dropout(weighted_child)
 
     nt2 = self.nt_emb2(nt_id)  # (batch_size, w_dim)
     gate_input = torch.cat([nt2, weighted_child], dim=-1)
     g = self.gate(gate_input)  # (batch_size, w_dim)
     c = g*nt2 + (1-g)*weighted_child  # (batch_size, w_dim)
 
-    return c, attn, g
+    return self.output(c), attn, g
 
 class TopDownRNNG(nn.Module):
   def __init__(self, action_dict,
@@ -496,7 +505,7 @@ class TopDownRNNG(nn.Module):
     self.h_dim = h_dim
     self.vocab_mlp.weight = self.emb[0].weight
 
-    self.composition = (AttentionComposition(w_dim, self.action_dict.num_nts())
+    self.composition = (AttentionComposition(w_dim, dropout, self.action_dict.num_nts())
                         if attention_composition else
                         LSTMComposition(w_dim, dropout))
     self.max_open_nts = max_open_nts

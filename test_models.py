@@ -26,7 +26,7 @@ class TestModels(unittest.TestCase):
     def test_attention_composition(self):
         w_dim = 2
         num_labels = 8
-        comp = AttentionComposition(w_dim, num_labels)
+        comp = AttentionComposition(w_dim, 0.1, num_labels)
 
         batch_size = 3
         children, ch_lengths = self._random_children(batch_size, w_dim)
