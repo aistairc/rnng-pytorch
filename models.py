@@ -814,7 +814,7 @@ class TopDownRNNG(nn.Module):
       reduce_idx = reduces.cpu().numpy()
       reduce_states = [states[i] for i in reduce_idx]
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
-      reduce_context = self._collect_stack_top_h(reduce_states)
+      reduce_context = self.stack_top_h(reduce_states)
       reduce_context = self.stack_to_hidden(reduce_context)
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
       new_stack_input[reduces] = new_child
@@ -839,8 +839,7 @@ class TopDownRNNG(nn.Module):
       beam[b] = []
       l = beam_lengths[b]
       for item in items[accum:accum+l]:
-        if (self._is_last_action(item.action, item.state, last_token) or
-            self.action_dict.is_shift(item.action)):
+        if (item.state.finished() or self.action_dict.is_shift(item.action)):
           # Cases where shifting last+1 token should be pruned by action masking.
           word_completed[b].append(item)
         else:
@@ -850,7 +849,7 @@ class TopDownRNNG(nn.Module):
 
   def _is_last_action(self, action, state, shifted_all):
     return (shifted_all and self.action_dict.is_reduce(action) and
-            state.nopen_parens == 0)
+            state.can_finish_by_reduce())
 
   def _flatten_items(self, items):
     flatten_items = []
@@ -894,9 +893,6 @@ class TopDownRNNG(nn.Module):
     ch_lengths = nt_ids.new_tensor(ch_lengths)
 
     return (children, ch_lengths, nt, nt_ids)
-
-  def _collect_stack_top_h(self, states):
-    return torch.stack([state.stack[-1][-1][0] for state in states], 0)
 
   def _collect_stack_top_context(self, states, idx = None, offset = 1):
     if idx is None:
@@ -1005,12 +1001,6 @@ class BeamItem:
 
   def do_action(self, action_dict):
     self.state.do_action(self.action, action_dict)
-
-  @staticmethod
-  def from_initial_stack(initial_stack_elem):
-    state = State.from_initial_stack(initial_stack_elem)
-    path = ActionPath()  # initial action is 0 (pad)
-    return BeamItem(state, path)
 
   @staticmethod
   def from_initial_state(initial_state):

@@ -86,7 +86,7 @@ class InOrderRNNG(TopDownRNNG):
         reduce_idx = reduces.cpu().numpy()
         reduce_states = [states[i] for i in reduce_idx]
         children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
-        reduce_context = self._collect_stack_top_h(reduce_states)
+        reduce_context = self.stack_top_h(reduce_states)
         reduce_context = self.stack_to_hidden(reduce_context)
         new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
         new_stack_input[reduces] = new_child
@@ -172,11 +172,7 @@ class InOrderState(TopDownState):
     elif action_dict.is_reduce(a):
       self.nopen_parens -= 1
       # To regard repetitive nt->reduce->nt->reduce ... as cons nts,
-      # we don't reset ncons_nts if previous action is nt. This is
-      # checked by the second top element is NT. This should save all
-      # cases.
-      nt_is_top_2 = (len(self.nt_index) > 0 and self.nt_index[-1] == len(self.stack) - 2 or
-                     self.nopen_parens == 0)
+      # we don't reset ncons_nts if previous action is nt.
       self.ncons_nts = self.ncons_nts if action_dict.is_nt(self.prev_a) else 0
     elif action_dict.is_finish(a):
       self.is_finished = True
