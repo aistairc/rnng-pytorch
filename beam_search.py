@@ -35,6 +35,10 @@ parser.add_argument('--word_beam_size', type=int, default=20)
 parser.add_argument('--shift_size', type=int, default=5)
 parser.add_argument('--batch_size', type=int, default=5)
 parser.add_argument('--block_size', type=int, default=100)
+parser.add_argument('--particle_filter', action='store_true', help='search with particle filter')
+parser.add_argument('--particle_size', type=int, default=10000)
+parser.add_argument('--original_reweight', action='store_true',
+                    help='If True, use the original reweighting (Eq. 4 in Crabbé et al. 2019) for particle filtering.')
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int)
 
@@ -73,6 +77,14 @@ def main(args):
     for parse in orig_order_parses:
       print(parse)
 
+  if args.particle_filter:
+    def parse(model, tokens):
+      return model.variable_beam_search(tokens, args.particle_size, args.original_reweight)
+  else:
+    def parse(model, tokens):
+      return model.word_sync_beam_search(
+        tokens, args.beam_size, args.word_beam_size, args.shift_size)
+
   with torch.no_grad():
 
     block_idxs = []
@@ -82,9 +94,7 @@ def main(args):
     for batch in tqdm(batches):
       tokens, batch_idx = batch
       tokens = tokens.cuda()
-      parses, surprisals = model.word_sync_beam_search(
-        tokens, args.beam_size, args.word_beam_size, args.shift_size)
-
+      parses, surprisals = parse(model, tokens)
       best_actions = [p[0][0] for p in parses]  # p[0][1] is likelihood
       trees = [action_dict.build_tree_str(best_actions[i],
                                           dataset.sents[batch_idx[i]].orig_tokens,

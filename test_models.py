@@ -272,6 +272,24 @@ class TestModels(unittest.TestCase):
             self.assertEqual([len(s) for s in surprisals], [3, 3])
             self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
+    def test_variable_beam_search(self):
+        with torch.no_grad():
+            model = self._get_simple_top_down_model()
+            x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+            parses, surprisals = model.variable_beam_search(x, 1000)
+
+            self.assertEqual(len(parses), 2)
+            self.assertTrue(len(parses[0]) > 0)
+
+            paths = set([tuple(parse) for parse, score in parses[0]])
+            self.assertEqual(len(paths), len(parses[0]))
+
+            for parse, score in parses[0]:
+                print([model.action_dict.i2a[action] for action in parse])
+            print(surprisals[0])
+            self.assertEqual([len(s) for s in surprisals], [3, 3])
+            self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
     def test_beam_search_in_order(self):
         with torch.no_grad():
             model = self._get_simple_in_order_model()

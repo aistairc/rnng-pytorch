@@ -630,9 +630,50 @@ class TopDownRNNG(nn.Module):
         surprisals[b].append(-word_marginal_ll[b][i] - (-word_marginal_ll[b][i-1] if i > 0 else 0))
     return parses, surprisals
 
+  def variable_beam_search(self, x, K, original_reweight=False):
+    self.eval()
+
+    beam = self.initial_particle_beam(x, K)
+    word_completed = [[] for _ in range(x.size(0))]
+    word_vecs = self.emb(x)
+    word_marginal_ll = [[] for _ in range(x.size(0))]
+
+    for pointer in range(x.size(1) + 1):
+      bucket_i = 0
+      while not all(len(batch_beam) == 0 for batch_beam in beam):
+        new_beam = self.get_successors_by_particle_filter(x, pointer, beam)
+        all_items, batch_idx = self._flatten_items(new_beam)
+        self.update_stack_rnn_beam(all_items, word_vecs, batch_idx, pointer)
+        beam_lengths = [len(batch_beam) for batch_beam in new_beam]
+        self.update_beam_and_word_completed(
+          beam, word_completed, all_items, beam_lengths, pointer == x.size(1))
+        bucket_i += 1
+
+      for b in range(len(beam)):
+        beam[b] = self.reweight_and_filter_particles(
+          word_completed[b], K, original_reweight=original_reweight)
+        word_completed[b] = []
+
+      marginal = self._get_marginal_ll(beam)
+      for b, s in enumerate(marginal):
+        word_marginal_ll[b].append(s)
+
+    parses = [sorted([(item.parse_actions(), item.score) for item in batch_beam],
+                     key=lambda x:x[1], reverse=True)
+              for batch_beam in beam]
+    surprisals = [[] for _ in range(len(beam))]
+    for b in range(len(beam)):
+      for i in range(0, len(word_marginal_ll[b])-1):
+        surprisals[b].append(-word_marginal_ll[b][i] - (-word_marginal_ll[b][i-1] if i > 0 else 0))
+    return parses, surprisals
+
   def initial_beam(self, x):
     states = self.initial_states(x)
     return [[BeamItem.from_initial_state(state)] for state in states]
+
+  def initial_particle_beam(self, x, K):
+    states = self.initial_states(x)
+    return [[ParticleBeamItem.from_initial_state(state, K)] for state in states]
 
   def initial_states(self, x, initial_stack = None):
     initial_hs = self._initial_hs(x, initial_stack)
@@ -664,7 +705,79 @@ class TopDownRNNG(nn.Module):
       x, pointer, beam, log_probs, beam_size, shift_size)
     return successors, forced_completions
 
-  def action_log_probs(self, states, action_mask, next_x = None):
+  def get_successors_by_particle_filter(self, x, pointer, beam):
+    all_items, _ = self._flatten_items(beam)
+    beam_lengths = [len(batch_beam) for batch_beam in beam]
+    states = [item.state for item in all_items]
+
+    if pointer < x.size(1):
+      next_x = [x[b, pointer].expand(beam_lengths[b]) for b in range(x.size(0))]
+      next_x = torch.cat(next_x)  # (total beam size)
+    else:
+      next_x = None
+
+    action_mask = self.valid_action_mask(all_items, x.size(1))  # (total beam size, n_actions)
+    log_probs, disc_log_probs = self.action_log_probs(states, action_mask, next_x, return_disc_probs=True)
+    new_K = (disc_log_probs.exp() * log_probs.new_tensor(
+      [item.particle_path.K for item in all_items]).unsqueeze(1)).round_()
+    new_K = new_K.view(-1)
+    mask = new_K > 0.0  # (total beam size * n_actions)
+    # action id can be obtained by (idx % n_actions)
+
+    offset = 0
+    successors = []
+    num_actions = log_probs.size(1)  # (total_beam_size*n_actions, 1)
+    log_probs = log_probs.view(-1)
+    disc_log_probs = disc_log_probs.view(-1)
+    # actions = torch.arange(0, mask.size(0), dtype=torch.long,
+    #                        device=new_K.device) % num_actions
+    for batch_i, beam_length in enumerate(beam_lengths):
+      b, e = offset*num_actions, (offset+beam_length)*num_actions
+      batch_active_idx = mask[b:e].nonzero().squeeze(1)
+      beam_id = (batch_active_idx // num_actions).cpu().numpy()
+      action_id = (batch_active_idx % num_actions).cpu().numpy()
+      active_idx = batch_active_idx + offset*num_actions
+      batch_K = new_K[active_idx].cpu().numpy()
+      batch_log_probs = log_probs[active_idx].cpu().numpy()
+      batch_disc_log_probs = disc_log_probs[active_idx].cpu().numpy()
+
+      successors.append([beam[batch_i][beam_id[i]].next_incomplete_item(
+        action_id[i], batch_K[i], batch_log_probs[i], batch_disc_log_probs[i])
+                         for i in range(len(beam_id))])
+      offset += beam_length
+
+    return successors
+
+  def reweight_and_filter_particles(self, batch_beam, K, upper_lex_size=1000,
+                                    original_reweight=False):
+    if original_reweight:
+      scores = torch.tensor([[b.particle_path.K,
+                              b.particle_path.gen_ll,
+                              b.particle_path.disc_ll] for b in batch_beam])
+      scores = torch.t(scores)
+      log_weights = scores[0].log() + scores[1] - scores[2]
+    else:
+      log_weights = torch.tensor([b.particle_path.gen_ll for b in batch_beam])
+
+    denom = torch.logsumexp(log_weights, 0)
+    unround_Ks = (log_weights - denom).exp() * K
+    new_Ks = unround_Ks.round()
+
+    active = (new_Ks > 0).nonzero().squeeze(1)
+    if active.size(0) > upper_lex_size:
+      active_Ks = unround_Ks[active]
+      _, sort_idx = torch.sort(active_Ks, descending=True)
+      active = active[sort_idx[:upper_lex_size]].cpu().numpy()
+    new_Ks = new_Ks.cpu().numpy()
+    new_beam = []
+    for i in active:
+      b = batch_beam[i]
+      b.particle_path.reweight(new_Ks[i])
+      new_beam.append(b)
+
+    return new_beam
+
+  def action_log_probs(self, states, action_mask, next_x = None, return_disc_probs = False):
     """
     states: tensor of size (batch, h_dim)
     new_x: tensor of size (batch)
@@ -676,6 +789,8 @@ class TopDownRNNG(nn.Module):
     action_logit[action_mask != 1] = -float('inf')
 
     log_probs = F.log_softmax(action_logit)  # (total beam size, num_actions)
+    if return_disc_probs:
+      disc_log_probs = log_probs.clone()
 
     if next_x is not None:  # shift is valid for next action
       word_logit = self.vocab_mlp(hiddens)
@@ -684,7 +799,10 @@ class TopDownRNNG(nn.Module):
       word_log_probs = self.word_criterion(word_logit, next_x) * -1.0  # (total beam size)
       log_probs[:, shift_idx] += word_log_probs
 
-    return log_probs
+    if return_disc_probs:
+      return (log_probs, disc_log_probs)
+    else:
+      return log_probs
 
   def valid_action_mask(self, items, sent_len):
     mask = torch.ones((len(items), self.num_actions), dtype=torch.uint8)
@@ -813,6 +931,8 @@ class TopDownRNNG(nn.Module):
   def update_stack_rnn(self, states, actions, shift_idx, shifted_embs):
     assert actions.size(0) == len(states)
     assert shift_idx.size(0) == shifted_embs.size(0)
+    if len(states) == 0:
+      return
 
     reduces = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
     nts = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
@@ -829,6 +949,7 @@ class TopDownRNNG(nn.Module):
       new_stack_input[reduces] = new_child
 
     new_stack_input[shift_idx] = shifted_embs
+
 
     nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
     nt_embs = self.nt_emb(nt_ids)
@@ -1028,3 +1149,50 @@ class BeamItem:
     state = self.state.copy()
     path = self.action_path.add_action(action, score)
     return BeamItem(state, path)
+
+class ParticlePath:
+  def __init__(self, K, prev=None, action=0, gen_ll=0.0, disc_ll=0.0):
+    self.K = K
+    self.prev = prev
+    self.action = action
+    self.gen_ll = gen_ll
+    self.disc_ll = disc_ll
+
+  def add_action(self, action, K, gen_local_score, disc_local_score):
+    return ParticlePath(K, self, action, self.gen_ll+gen_local_score, self.disc_ll+disc_local_score)
+
+  def normalized_weight(self):
+    return self.K * np.exp(self.gen_ll - self.disc_ll)
+
+  def reweight(self, new_K):
+    self.K = new_K
+
+  def foreach(self, f):
+    f(self)
+    if self.prev is not None:
+      self.prev.foreach(f)
+
+class ParticleBeamItem:
+  def __init__(self, state, particle_path):
+    self.state = state
+    self.particle_path = particle_path
+    self.action = self.particle_path.action
+    self.score = self.particle_path.gen_ll
+
+  @staticmethod
+  def from_initial_state(initial_state, K):
+    path = ParticlePath(K)  # initial action is 0 (pad)
+    return ParticleBeamItem(initial_state, path)
+
+  def parse_actions(self):
+    actions = []
+    def add_action(path):
+      actions.append(path.action)
+    self.particle_path.foreach(add_action)
+    assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
+    return list(reversed(actions[:-1]))
+
+  def next_incomplete_item(self, action, K, log_prob, disc_log_prob):
+    state = self.state.copy()
+    path = self.particle_path.add_action(action, K, log_prob, disc_log_prob)
+    return ParticleBeamItem(state, path)
