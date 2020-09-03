@@ -1161,9 +1161,6 @@ class ParticlePath:
   def add_action(self, action, K, gen_local_score, disc_local_score):
     return ParticlePath(K, self, action, self.gen_ll+gen_local_score, self.disc_ll+disc_local_score)
 
-  def normalized_weight(self):
-    return self.K * np.exp(self.gen_ll - self.disc_ll)
-
   def reweight(self, new_K):
     self.K = new_K
 
