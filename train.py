@@ -40,6 +40,8 @@ parser.add_argument('--num_layers', default=2, type=int, help='number of layers 
 parser.add_argument('--dropout', default=0.5, type=float, help='dropout rate')
 parser.add_argument('--composition', default='lstm', choices=['lstm', 'attention'],
                     help='lstm: original lstm composition; attention: gated attention introduced in Kuncoro et al. (2017).')
+parser.add_argument('--not_swap_in_order_stack', action='store_true',
+                    help='If True, prevent swapping elements by an open action for the in-order system.')
 # Optimization options
 parser.add_argument('--optimizer', choices=['sgd', 'adam'], help='Which optimizer to use.')
 parser.add_argument('--no_random_unk', action='store_true', help='Prohibit to randomly replace a token to <unk> on training sentences (in default, randomly replace).')
@@ -90,6 +92,7 @@ def create_model(args, action_dict, vocab):
   if args.strategy == 'top_down':
     model = TopDownRNNG(**model_args)
   elif args.strategy == 'in_order':
+    model_args['do_swap_in_rnn'] = not args.not_swap_in_order_stack
     model = InOrderRNNG(**model_args)
   if args.param_init > 0:
     for param in model.parameters():

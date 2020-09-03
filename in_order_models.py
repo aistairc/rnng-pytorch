@@ -14,14 +14,16 @@ class InOrderRNNG(TopDownRNNG):
                h_dim = 20,
                num_layers = 1,
                dropout = 0,
-               attention_composition=False,
+               attention_composition = False,
                max_open_nts = 100,
                max_cons_nts = 8,
+               do_swap_in_rnn = True,
   ):
     super(InOrderRNNG, self).__init__(action_dict, vocab, padding_idx,
                                       w_dim, h_dim, num_layers,
                                       dropout, attention_composition,
                                       max_open_nts, max_cons_nts)
+    self.do_swap_in_rnn = do_swap_in_rnn
 
   def initial_states(self, x, initial_stack = None):
     initial_hs = self._initial_hs(x, initial_stack)
@@ -103,15 +105,19 @@ class InOrderRNNG(TopDownRNNG):
 
     if nts.size(0) > 0:
       nt_idx = nts.cpu().numpy()
-      # For nt, current top stack is discarded; insert two elements top of the current
-      # 2nd-top element.
-      nt_stack_top2_context = self._collect_stack_top_context(states, nt_idx, 2)
       nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
       nt_embs = self.nt_emb(nt_ids)  # new_stack_input for nt
-
-      nt_stack_top_context = self.stack_rnn(nt_embs, nt_stack_top2_context)
-      left_corners = torch.stack([states[i].stack_trees[-1] for i in nt_idx], 0)
-      nt_new_stack_top = self.stack_rnn(left_corners, nt_stack_top_context)
+      if self.do_swap_in_rnn:
+        # For nt, current top stack is discarded; insert two elements top of the current
+        # 2nd-top element.
+        nt_stack_top2_context = self._collect_stack_top_context(states, nt_idx, 2)
+        nt_stack_top_context = self.stack_rnn(nt_embs, nt_stack_top2_context)
+        left_corners = torch.stack([states[i].stack_trees[-1] for i in nt_idx], 0)
+        nt_new_stack_top = self.stack_rnn(left_corners, nt_stack_top_context)
+      else:
+        # state.stack is not swapped, only stack_trees is swapped.
+        nt_stack_top_context = self._collect_stack_top_context(states, nt_idx, 1)
+        nt_new_stack_top = self.stack_rnn(nt_embs, nt_stack_top_context)
 
       for i, b in enumerate(nt_idx):
         new_stack_tops_b = [[[layer[0][i], layer[1][i]] for layer in nt_stack_top_context],
