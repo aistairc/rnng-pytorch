@@ -35,10 +35,14 @@ parser.add_argument('--word_beam_size', type=int, default=20)
 parser.add_argument('--shift_size', type=int, default=5)
 parser.add_argument('--batch_size', type=int, default=5)
 parser.add_argument('--block_size', type=int, default=100)
+parser.add_argument('--delay_word_ll', action='store_true',
+                    help='Adding shift word probability is delayed at word-synchronizing step')
 parser.add_argument('--particle_filter', action='store_true', help='search with particle filter')
 parser.add_argument('--particle_size', type=int, default=10000)
 parser.add_argument('--original_reweight', action='store_true',
                     help='If True, use the original reweighting (Eq. 4 in Crabbé et al. 2019) for particle filtering.')
+parser.add_argument('--dump_beam', action='store_true',
+                    help='(For debug and model development) print out all states in the beam at each step')
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int)
 
@@ -77,13 +81,24 @@ def main(args):
     for parse in orig_order_parses:
       print(parse)
 
+  def dump_histroy(beam_history, sents):
+    for pointer, bucket_i, beam, word_completed in beam_history:
+      print('pointer: {}, i: {}'.format(pointer, bucket_i))
+      for batch_i in range(len(beam)):
+        for b in beam[batch_i]:
+          print('beam: b_i: {}, {}'.format(batch_i, b.dump(action_dict, sents[batch_i])))
+        for b in word_completed[batch_i]:
+          print('word_comp: b_i: {}, {}'.format(batch_i, b.dump(action_dict, sents[batch_i])))
+        print()
+
   if args.particle_filter:
-    def parse(model, tokens):
+    def parse(model, tokens, return_beam_history=False):
       return model.variable_beam_search(tokens, args.particle_size, args.original_reweight)
   else:
-    def parse(model, tokens):
+    def parse(model, tokens, return_beam_history=False):
       return model.word_sync_beam_search(
-        tokens, args.beam_size, args.word_beam_size, args.shift_size)
+        tokens, args.beam_size, args.word_beam_size, args.shift_size, args.delay_word_ll,
+        return_beam_history=return_beam_history)
 
   with torch.no_grad():
 
@@ -94,7 +109,13 @@ def main(args):
     for batch in tqdm(batches):
       tokens, batch_idx = batch
       tokens = tokens.cuda()
-      parses, surprisals = parse(model, tokens)
+
+      if args.dump_beam:
+        parses, surprisals, beam_history = parse(model, tokens, True)
+        dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
+      else:
+        parses, surprisals = parse(model, tokens, False)
+
       best_actions = [p[0][0] for p in parses]  # p[0][1] is likelihood
       trees = [action_dict.build_tree_str(best_actions[i],
                                           dataset.sents[batch_idx[i]].orig_tokens,
