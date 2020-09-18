@@ -14,6 +14,8 @@ from collections import defaultdict
 import utils
 import re
 import json
+from multiprocessing import Pool
+import itertools
 
 from data import Sentence, Vocabulary
 from action_dict import TopDownActionDict, InOrderActionDict
@@ -103,26 +105,60 @@ def pad(ls, length, symbol):
         return ls[:length]
     return ls + [symbol] * (length -len(ls))
 
+def find_nts_in_tree(tree):
+    tree = tree.strip()
+    return re.findall(r'(?=\(([^\s]+)\s\()', tree)
+
+def get_sent_info(arg):
+    tree, setting = arg
+    tree = tree.strip()
+    lowercase, replace_num, vocab, action_dict, io_action_dict = setting
+    top_down_actions = get_actions(tree)
+    in_order_actions = utils.get_in_order_actions(tree)
+    tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
+    orig_tokens = tokens[:]
+    assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
+    if lowercase:
+        tokens = tokens_lower
+    if replace_num:
+        tokens = [utils.clean_number(w) for w in tokens]
+    token_ids = [vocab.get_id(t) for t in tokens]
+    top_down_action_ids = action_dict.to_id(top_down_actions)
+    in_order_action_ids = io_action_dict.to_id(in_order_actions)
+    conved_tokens = [vocab.i2w[w_i] for w_i in token_ids]
+
+    return {
+        'orig_tokens': orig_tokens,
+        'tokens': conved_tokens,
+        'token_ids': token_ids,
+        'tags': tags,
+        'actions': top_down_actions,
+        'action_ids': top_down_action_ids,
+        'in_order_actions': in_order_actions,
+        'in_order_action_ids': in_order_action_ids,
+        'tree_str': tree
+    }
+
 def get_data(args):
     pad = '<pad>'
     unk = '<unk>'
     def make_vocab(textfile, seqlength, minseqlength,lowercase, replace_num,
                    vocabsize, vocabminfreq, unkmethod, apply_length_filter=True):
         w2c = defaultdict(int)
-        for tree in open(textfile, 'r'):
-            tree = tree.strip()
-            tags, sent, sent_lower = get_tags_tokens_lowercase(tree)
+        with open(textfile, 'r') as f:
+            trees = [tree.strip() for tree in f]
+        with Pool() as pool:
+            for tags, sent, sent_lower in pool.map(get_tags_tokens_lowercase, trees):
+                assert(len(tags) == len(sent))
+                if lowercase:
+                    sent = sent_lower
+                if replace_num:
+                    sent = [utils.clean_number(w) for w in sent]
+                if (len(sent) > seqlength and apply_length_filter) or len(sent) < minseqlength:
+                    continue
 
-            assert(len(tags) == len(sent))
-            if lowercase:
-                sent = sent_lower
-            if replace_num:
-                sent = [utils.clean_number(w) for w in sent]
-            if (len(sent) > seqlength and apply_length_filter) or len(sent) < minseqlength:
-                continue
-
-            for word in sent:
-                w2c[word] += 1
+                for word in sent:
+                    w2c[word] += 1
         if unkmethod == 'berkeleyrule':
             berkeley_unks = set([utils.berkeley_unk_conv(w) for w, c in w2c.items()])
             specials = list(berkeley_unks)
@@ -138,9 +174,11 @@ def get_data(args):
     def get_nonterminals(textfiles):
         nts = set()
         for fn in textfiles:
-            for tree in open(fn, 'r'):
-                tree = tree.strip()
-                nts.update(re.findall(r'(?=\(([^\s]+)\s\()', tree))
+            with open(fn, 'r') as f:
+                lines = [line for line in f]
+            with Pool() as pool:
+                local_nts = pool.map(find_nts_in_tree, lines)
+                nts.update(list(itertools.chain.from_iterable(local_nts)))
         nts = sorted(list(nts))
         print('Found nonterminals: {}'.format(nts))
         return nts
@@ -148,41 +186,17 @@ def get_data(args):
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
                 outfile, vocab, action_dict, io_action_dict, apply_length_filter=True):
         dropped = 0
-        sent_id = 0
         sentences = []
-        for tree in open(textfile, 'r'):
-            tree = tree.strip()
-            top_down_actions = get_actions(tree)
-            in_order_actions = utils.get_in_order_actions(tree)
-            tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
-            orig_tokens = tokens[:]
-            assert(len(tags) == len(tokens))
-            if lowercase:
-                tokens = tokens_lower
-            if (len(tokens) > seqlength and apply_length_filter) or len(tokens) < minseqlength:
-                dropped += 1
-                continue
-            if replace_num:
-                tokens = [utils.clean_number(w) for w in tokens]
-            token_ids = [vocab.get_id(t) for t in tokens]
-            top_down_action_ids = action_dict.to_id(top_down_actions)
-            in_order_action_ids = io_action_dict.to_id(in_order_actions)
-            assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
-            conved_tokens = [vocab.i2w[w_i] for w_i in token_ids]
-            sentences.append({
-                'orig_tokens': orig_tokens,
-                'tokens': conved_tokens,
-                'token_ids': token_ids,
-                'tags': tags,
-                'actions': top_down_actions,
-                'action_ids': top_down_action_ids,
-                'in_order_actions': in_order_actions,
-                'in_order_action_ids': in_order_action_ids,
-                'tree_str': tree
-            })
-            sent_id += 1
-            if sent_id % 100000 == 0:
-                print("{} sentences processed".format(sent_id))
+        conv_setting = (lowercase, replace_num, vocab, action_dict, io_action_dict)
+        with open(textfile, 'r') as f:
+            tree_with_settings = [(tree, conv_setting) for tree in f]
+        with Pool() as pool:
+            for sent_info in pool.map(get_sent_info, tree_with_settings):
+                tokens = sent_info['tokens']
+                if apply_length_filter and (len(tokens) > seqlength or len(tokens) < minseqlength):
+                    dropped += 1
+                    continue
+                sentences.append(sent_info)
 
         print(len(sentences))
 
@@ -207,7 +221,7 @@ def get_data(args):
         print('Loading pre-specified source vocab from ' + args.vocabfile)
         vocab = Vocabulary.load(args.vocabfile)
     else:
-        print("First pass through data to get vocab...")
+        print("Second pass through data to get vocab...")
         vocab = make_vocab(args.trainfile, args.seqlength, args.minseqlength,
                            args.lowercase, args.replace_num, args.vocabsize, args.vocabminfreq,
                            args.unkmethod, 1)
