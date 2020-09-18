@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
 from utils import *
-from TreeCRF import ConstituencyTreeCRF
 from torch.distributions import Bernoulli
 import itertools
 
