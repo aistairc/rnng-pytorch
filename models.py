@@ -574,7 +574,8 @@ class TopDownRNNG(nn.Module):
     iemb = self.initial_emb(x.new_zeros(x.size(0)))
     return self.stack_rnn(iemb, None)
 
-  def word_sync_beam_search(self, x, beam_size, word_beam_size = 0, shift_size = 0):
+  def word_sync_beam_search(self, x, beam_size, word_beam_size = 0, shift_size = 0,
+                            delay_word_ll = False, return_beam_history = False):
     self.eval()
 
     if word_beam_size <= 0:
@@ -585,14 +586,15 @@ class TopDownRNNG(nn.Module):
     word_vecs = self.emb(x)
     word_marginal_ll = [[] for _ in range(x.size(0))]
 
+    if return_beam_history:
+      beam_histroy = []
+
     for pointer in range(x.size(1) + 1):
       forced_completions = [0 for _ in range(x.size(0))]
       bucket_i = 0
       while not all(len(batch_beam) == 0 for batch_beam in beam):
-        successors, added_forced_completions = self.get_successors(
-          x, pointer, beam, beam_size, shift_size)
-        new_beam = [[beam[batch_i][b].next_incomplete_item(a, s) for (b, a, s) in batch_succs]
-                    for batch_i, batch_succs in enumerate(successors)]
+        new_beam, added_forced_completions = self.get_successors(
+          x, pointer, beam, beam_size, shift_size, delay_word_ll)
         for i, c in enumerate(added_forced_completions):
           forced_completions[i] += c
 
@@ -605,15 +607,19 @@ class TopDownRNNG(nn.Module):
           beam, word_completed, all_items, beam_lengths, pointer == x.size(1))
 
         for b in range(len(beam)):
-          # Condition to stop beam for current word. This follows original implementation (rnng-bert),
-          # but following the paper, the true condition might be
-          # `len(word_completed[b]) >= word_beam_size` or
-          # `len(word_completed[b]) - forced_completions[b] >= word_beam_size`?
           if len(word_completed[b]) - forced_completions[b] >= beam_size:
             beam[b] = []
+        if return_beam_history:
+          beam_histroy.append((pointer,
+                               bucket_i,
+                               [b[:] for b in beam],
+                               [b[:] for b in word_completed]))
         bucket_i += 1
 
       for b in range(len(beam)):
+        if delay_word_ll and pointer < x.size(1):
+          for item in word_completed[b]:
+            item.action_path.incorporate_word_ll()  # this will impact the score used below.
         word_completed[b].sort(key=lambda x: x.score, reverse=True)
         beam[b] = word_completed[b][:word_beam_size]
         word_completed[b] = []
@@ -628,7 +634,11 @@ class TopDownRNNG(nn.Module):
     for b in range(len(beam)):
       for i in range(0, len(word_marginal_ll[b])-1):
         surprisals[b].append(-word_marginal_ll[b][i] - (-word_marginal_ll[b][i-1] if i > 0 else 0))
-    return parses, surprisals
+
+    ret = (parses, surprisals)
+    if return_beam_history:
+      ret += (beam_histroy,)
+    return ret
 
   def variable_beam_search(self, x, K, original_reweight=False):
     self.eval()
@@ -684,7 +694,7 @@ class TopDownRNNG(nn.Module):
     return [[(stack_layer[0][b], stack_layer[1][b]) for stack_layer in initial_stack]
             for b in range(x.size(0))]
 
-  def get_successors(self, x, pointer, beam, beam_size, shift_size):
+  def get_successors(self, x, pointer, beam, beam_size, shift_size, delay_word_ll = False):
     all_items, _ = self._flatten_items(beam)
     beam_lengths = [len(batch_beam) for batch_beam in beam]
     states = [item.state for item in all_items]
@@ -696,13 +706,30 @@ class TopDownRNNG(nn.Module):
       next_x = None
 
     action_mask = self.valid_action_mask(all_items, x.size(1))  # (total beam size, n_actions)
-    log_probs = self.action_log_probs(states, action_mask, next_x)  # tensor of size (total beam, n_actions)
-    log_probs += log_probs.new_tensor([item.score for item in all_items]).unsqueeze(1)
 
-    log_probs = self._deflatten_items(log_probs, beam_lengths)
+    if delay_word_ll:
+      log_probs, disc_log_probs = self.action_log_probs(states, action_mask, next_x, return_disc_probs=True)
+      local_gen_probs = (log_probs - disc_log_probs).cpu().numpy()
+      local_gen_probs = self._deflatten_items(local_gen_probs, beam_lengths)
+      log_probs = disc_log_probs
+      log_probs += log_probs.new_tensor([item.score for item in all_items]).unsqueeze(1)
+      log_probs = self._deflatten_items(log_probs, beam_lengths)
+      successors, forced_completions = self.scores_to_successors(
+        x, pointer, beam, log_probs, beam_size, shift_size)
 
-    successors, forced_completions = self.scores_to_successors(
-      x, pointer, beam, log_probs, beam_size, shift_size)
+      successors = [[beam[batch_i][b].next_incomplete_item(a, s, local_gen_probs[batch_i][b][a])
+                     for (b, a, s) in batch_succs]
+                    for batch_i, batch_succs in enumerate(successors)]
+    else:
+      log_probs = self.action_log_probs(states, action_mask, next_x)  # tensor of size (total beam, n_actions)
+      log_probs += log_probs.new_tensor([item.score for item in all_items]).unsqueeze(1)
+      log_probs = self._deflatten_items(log_probs, beam_lengths)
+      successors, forced_completions = self.scores_to_successors(
+        x, pointer, beam, log_probs, beam_size, shift_size)
+
+      successors = [[beam[batch_i][b].next_incomplete_item(a, s) for (b, a, s) in batch_succs]
+                    for batch_i, batch_succs in enumerate(successors)]
+
     return successors, forced_completions
 
   def get_successors_by_particle_filter(self, x, pointer, beam):
@@ -995,7 +1022,7 @@ class TopDownRNNG(nn.Module):
     for b, b_len in enumerate(beam_lengths):
       de_items.append(items[accum_idx:accum_idx+b_len])
       accum_idx += b_len
-    assert accum_idx == items.size(0)
+    assert accum_idx == len(items)
     return de_items  # List[Tensor]
 
   def _collect_children_for_reduce(self, reduce_states):
@@ -1109,25 +1136,33 @@ class TopDownState:
     self.stack_trees.append(new_tree_elem)
 
 class ActionPath:
-  def __init__(self, prev=None, action=0, score=0.0):
+  def __init__(self, prev=None, action=0, score=0.0, local_word_ll=0.0):
     self.prev = prev
     self.action = action
     self.score = score
+    self.local_word_ll = local_word_ll
 
-  def add_action(self, action, score):
-    return ActionPath(self, action, score)
+  def add_action(self, action, score, local_word_ll=0.0):
+    return ActionPath(self, action, score, local_word_ll)
 
   def foreach(self, f):
     f(self)
     if self.prev is not None:
       self.prev.foreach(f)
 
+  def incorporate_word_ll(self):
+    self.local_word_ll < 0
+    self.score += self.local_word_ll
+
 class BeamItem:
   def __init__(self, state, action_path):
     self.state = state
     self.action_path = action_path
     self.action = self.action_path.action
-    self.score = self.action_path.score
+
+  @property
+  def score(self):
+    return self.action_path.score
 
   def do_action(self, action_dict):
     self.state.do_action(self.action, action_dict)
@@ -1145,10 +1180,16 @@ class BeamItem:
     assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
     return list(reversed(actions[:-1]))
 
-  def next_incomplete_item(self, action, score):
+  def next_incomplete_item(self, action, score, local_word_ll=0.0):
     state = self.state.copy()
-    path = self.action_path.add_action(action, score)
+    path = self.action_path.add_action(action, score, local_word_ll)
     return BeamItem(state, path)
+
+  def dump(self, action_dict, sent):
+    actions = self.parse_actions()
+    stack_str = action_dict.build_tree_str(
+      actions, sent.orig_tokens, ["" for _ in range(len(sent.orig_tokens))])
+    return "[{}]; {:.2f}; a={}, ".format(stack_str, self.score, self.action)
 
 class ParticlePath:
   def __init__(self, K, prev=None, action=0, gen_ll=0.0, disc_ll=0.0):
@@ -1174,7 +1215,10 @@ class ParticleBeamItem:
     self.state = state
     self.particle_path = particle_path
     self.action = self.particle_path.action
-    self.score = self.particle_path.gen_ll
+
+  @property
+  def score(self):
+    return self.particle_path.gen_ll
 
   @staticmethod
   def from_initial_state(initial_state, K):
