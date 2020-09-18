@@ -188,39 +188,39 @@ class TestModels(unittest.TestCase):
             x = torch.tensor([[2, 3, 4], [1, 2, 5]])
             initial_beam = model.initial_beam(x)
             beam = initial_beam
-            successors, forced_completions = model.get_successors(x, 0, beam, 5, 2)
+            new_beam, forced_completions = model.get_successors(x, 0, beam, 5, 2)
             self.assertEqual(forced_completions, [0, 0])  # shift is prohibited for initial action
-            self.assertEqual([len(s) for s in successors], [4, 4])
-            self.assertTrue(all((successors[0][i][2] > successors[0][i+1][2] and
-                                 successors[0][i][2] != -float('inf'))
-                                for i in range(len(successors[0])-1)))
+            self.assertEqual([len(b) for b in new_beam], [4, 4])
+            self.assertTrue(all((new_beam[0][i].score > new_beam[0][i+1].score and
+                                 new_beam[0][i].score != -float('inf'))
+                                for i in range(len(new_beam[0])-1)))
 
             # shift is valid after an NT
             beam = [[simulate(['NT(S)'])],
                     [simulate(['NT(NP)', 'NT(NP)']),
                      simulate(['NT(NP)', 'NT(VP)'])]]
-            successors, forced_completions = model.get_successors(x, 0, beam, 8, 2)
+            new_beam, forced_completions = model.get_successors(x, 0, beam, 8, 2)
             self.assertEqual(forced_completions, [0, 2])
-            self.assertEqual([len(s) for s in successors], [5, 4+4+2])
-            self.assertTrue(all((successors[0][i][2] > successors[0][i+1][2] and
-                                 successors[0][i][2] != -float('inf'))
-                                for i in range(len(successors[0])-1)))
+            self.assertEqual([len(b) for b in new_beam], [5, 4+4+2])
+            self.assertTrue(all((new_beam[0][i].score > new_beam[0][i+1].score and
+                                 new_beam[0][i].score != -float('inf'))
+                                for i in range(len(new_beam[0])-1)))
 
             # reduce is valid after SHIFT
             beam = [[simulate(['NT(S)', 'NT(NP)', 'NT(NP)', 'SHIFT'])],  # can reduce
                     [simulate(['NT(NP)', 'NT(NP)', 'SHIFT']),  # can reduce
                      simulate(['NT(NP)', 'SHIFT', 'NT(VP)'])]]  # cannot reduce
-            successors, forced_completions = model.get_successors(x, 0, beam, 12, 2)
+            new_beam, forced_completions = model.get_successors(x, 0, beam, 12, 2)
             self.assertEqual(forced_completions, [0, 0])
-            self.assertEqual([len(s) for s in successors], [6, 6+5])
+            self.assertEqual([len(s) for s in new_beam], [6, 6+5])
 
             # only reduce after shifting all
             beam = [[simulate(['NT(S)', 'SHIFT', 'SHIFT', 'SHIFT'])],  # can finish
                     [simulate(['NT(NP)', 'NT(NP)', 'SHIFT', 'SHIFT', 'SHIFT']),  # cannot finish
                      simulate(['NT(NP)', 'SHIFT', 'NT(VP)', 'SHIFT', 'SHIFT'])]]  # cannot finish
-            successors, forced_completions = model.get_successors(x, 3, beam, 12, 2)
+            new_beam, forced_completions = model.get_successors(x, 3, beam, 12, 2)
             self.assertEqual(forced_completions, [0, 0])
-            self.assertEqual([len(s) for s in successors], [1, 2])
+            self.assertEqual([len(b) for b in new_beam], [1, 2])
 
     def test_update_stack_rnn(self):
         model = self._get_simple_top_down_model()
@@ -259,6 +259,24 @@ class TestModels(unittest.TestCase):
             model = self._get_simple_top_down_model()
             x = torch.tensor([[2, 3, 4], [1, 2, 5]])
             parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+
+            self.assertEqual(len(parses), 2)
+            self.assertEqual(len(parses[0]), 5)
+
+            paths = set([tuple(parse) for parse, score in parses[0]])
+            self.assertEqual(len(paths), 5)
+
+            for parse, score in parses[0]:
+                print([model.action_dict.i2a[action] for action in parse])
+            print(surprisals[0])
+            self.assertEqual([len(s) for s in surprisals], [3, 3])
+            self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
+    def test_beam_search_delay_word_ll(self):
+        with torch.no_grad():
+            model = self._get_simple_top_down_model()
+            x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+            parses, surprisals = model.word_sync_beam_search(x, 8, 5, 0, delay_word_ll=True)
 
             self.assertEqual(len(parses), 2)
             self.assertEqual(len(parses[0]), 5)
