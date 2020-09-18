@@ -91,7 +91,7 @@ class InOrderRNNG(TopDownRNNG):
         reduce_context = self.stack_top_h(reduce_states)
         reduce_context = self.stack_to_hidden(reduce_context)
         new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
-        new_stack_input[reduces] = new_child
+        new_stack_input[reduces] = new_child.float()
 
       new_stack_input[shift_idx] = shifted_embs
       not_nt_new_stack_input = new_stack_input[not_nts]

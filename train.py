@@ -61,6 +61,7 @@ parser.add_argument('--seed', default=3435, type=int, help='random seed')
 parser.add_argument('--print_every', type=int, default=500, help='print stats after this many batches')
 parser.add_argument('--tensorboard_log_dir', default='',
                     help='If not empty, tensor board summaries are recorded on the directory `tensor_board_log_dir/save_path`')
+parser.add_argument('--amp', action='store_true')
 
 class TensorBoardLogger(object):
   def __init__(self, args):
@@ -137,6 +138,10 @@ def main(args):
   decay= 0
   best_val_loss = 5e10
   val_losses = []
+
+  if args.amp:
+    scaler = torch.cuda.amp.GradScaler()
+
   while epoch < args.num_epochs:
     start_time = time.time()
     epoch += 1
@@ -154,19 +159,35 @@ def main(args):
       action_ids = action_ids.cuda()
       b += 1
       optimizer.zero_grad()
-      loss, a_loss, w_loss, _ = model(token_ids, action_ids)
+
+      def calc_loss():
+        loss, a_loss, w_loss, _ = model(token_ids, action_ids)
+        if args.loss_normalize == 'sum':
+          loss = loss
+        elif args.loss_normalize == 'batch':
+          loss = loss / token_ids.size(0)
+        elif args.loss_normalize == 'action':
+          loss = loss / a_loss.size(0)
+        return loss, a_loss, w_loss
+
+      if args.amp:
+        with torch.cuda.amp.autocast():
+          loss, a_loss, w_loss = calc_loss()
+          scaler.scale(loss).backward()
+        if args.max_grad_norm > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        scaler.step(optimizer)
+        scaler.update()
+      else:
+        loss, a_loss, w_loss = calc_loss()
+        loss.backward()
+        if args.max_grad_norm > 0:
+          torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+        optimizer.step()
       total_a_ll += -a_loss.sum().detach().item()
       total_w_ll += -w_loss.sum().detach().item()
-      if args.loss_normalize == 'sum':
-        loss = loss
-      elif args.loss_normalize == 'batch':
-        loss = loss / token_ids.size(0)
-      elif args.loss_normalize == 'action':
-        loss = loss / a_loss.size(0)
-      loss.backward()
-      if args.max_grad_norm > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-      optimizer.step()
+
       num_sents += token_ids.size(0)
       assert token_ids.size(0) * token_ids.size(1) == w_loss.size(0)
       num_words += w_loss.size(0)
