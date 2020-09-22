@@ -19,7 +19,6 @@ import numpy as np
 import time
 import logging
 from data import Dataset
-from models import RNNG
 from utils import *
 
 logger = logging.getLogger('train')
