@@ -320,6 +320,8 @@ class RNNGCell(nn.Module):
     nt_batches = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
     shift_batches = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
 
+    new_input = word_vecs.new_zeros(word_vecs.size(0), self.input_size)
+
     # First fill in trees. Then, gather those added elements in a column, which become
     # the input to stack_rnn.
     if shift_batches.size(0) > 0:
@@ -327,11 +329,13 @@ class RNNGCell(nn.Module):
       shift_idx = stack.pointer[shift_batches].view(-1, 1, 1).expand(-1, 1, word_vecs.size(-1))
       shifted_embs = torch.gather(word_vecs[shift_batches], 1, shift_idx).squeeze(1)
       stack.do_shift(shift_batches, shifted_embs)
+      new_input[shift_batches] = shifted_embs
 
     if nt_batches.size(0) > 0:
       nt_ids = (actions[nt_batches] - self.action_dict.nt_begin_id())
       nt_embs = self.nt_emb(nt_ids)
       stack.do_nt(nt_batches, nt_embs, nt_ids)
+      new_input[nt_batches] = nt_embs
 
     if reduce_batches.size(0) > 0:
       children, ch_lengths, reduced_nt, reduced_nt_ids = stack.collect_reduced_children(reduce_batches)
@@ -342,8 +346,8 @@ class RNNGCell(nn.Module):
         stack_h = None
       new_child, _, _ = self.composition(children, ch_lengths, reduced_nt, reduced_nt_ids, stack_h)
       stack.do_reduce(reduce_batches, new_child)
+      new_input[reduce_batches] = new_child
 
-    new_input = stack.trees[stack.batch_index, stack.top_position-1]  # index for stack.trees is smaller by 1.
     new_hidden, new_cell = self.stack_rnn(new_input, (stack.hidden_head(1), stack.cell_head(1)))
 
     stack.update_hidden(new_hidden, new_cell)
@@ -421,7 +425,6 @@ class FixedStackRNNG(nn.Module):
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
     loss = (a_loss.sum() + w_loss.sum())
-    print(loss.item())
     return loss, a_loss, w_loss, stack
 
   def unroll_states(self, stack, word_vecs, actions):
