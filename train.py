@@ -22,6 +22,8 @@ import logging
 from data import Dataset
 from models import TopDownRNNG
 from in_order_models import InOrderRNNG
+from fixed_stack_models import FixedStackRNNG
+from fixed_stack_in_order_models import FixedStackInOrderRNNG
 from utils import *
 
 logger = logging.getLogger('train')
@@ -33,6 +35,7 @@ parser.add_argument('--train_file', default='data/ptb-no-unk-train.json')
 parser.add_argument('--val_file', default='data/ptb-no-unk-val.json')
 parser.add_argument('--train_from', default='')
 # Model options
+parser.add_argument('--fixed_stack', action='store_true')
 parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
 parser.add_argument('--w_dim', default=650, type=int, help='input/output word dimension')
 parser.add_argument('--h_dim', default=650, type=int, help='LSTM hidden dimension')
@@ -59,6 +62,7 @@ parser.add_argument('--max_grad_norm', default=5, type=float, help='gradient cli
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int, help='random seed')
 parser.add_argument('--print_every', type=int, default=500, help='print stats after this many batches')
+parser.add_argument('--valid_every', type=int, default=-1, help='If > 0, validate and save model every this many batches')
 parser.add_argument('--tensorboard_log_dir', default='',
                     help='If not empty, tensor board summaries are recorded on the directory `tensor_board_log_dir/save_path`')
 parser.add_argument('--amp', action='store_true')
@@ -91,10 +95,16 @@ def create_model(args, action_dict, vocab):
                 'attention_composition': args.composition == 'attention'}
 
   if args.strategy == 'top_down':
-    model = TopDownRNNG(**model_args)
+    if args.fixed_stack:
+      model = FixedStackRNNG(**model_args)
+    else:
+      model = TopDownRNNG(**model_args)
   elif args.strategy == 'in_order':
-    model_args['do_swap_in_rnn'] = not args.not_swap_in_order_stack
-    model = InOrderRNNG(**model_args)
+    if args.fixed_stack:
+      model = FixedStackInOrderRNNG(**model_args)
+    else:
+      model_args['do_swap_in_rnn'] = not args.not_swap_in_order_stack
+      model = InOrderRNNG(**model_args)
   if args.param_init > 0:
     for param in model.parameters():
       param.data.uniform_(-args.param_init, args.param_init)
@@ -142,6 +152,7 @@ def main(args):
   if args.amp:
     scaler = torch.cuda.amp.GradScaler()
 
+  global_batch_i = 0
   while epoch < args.num_epochs:
     start_time = time.time()
     epoch += 1
@@ -158,6 +169,7 @@ def main(args):
       token_ids = token_ids.cuda()
       action_ids = action_ids.cuda()
       b += 1
+      global_batch_i += 1
       optimizer.zero_grad()
 
       def calc_loss():
@@ -189,9 +201,12 @@ def main(args):
       total_w_ll += -w_loss.sum().detach().item()
 
       num_sents += token_ids.size(0)
-      assert token_ids.size(0) * token_ids.size(1) == w_loss.size(0)
+      # assert token_ids.size(0) * token_ids.size(1) == w_loss.size(0)
       num_words += w_loss.size(0)
       num_actions += a_loss.size(0)
+
+      # trying to obtain a discrete value that would have meaning at each epoch boundary.
+      continuous_epoch = int(((epoch-1) + (b / len(train_data))) * 10000)
 
       if b % args.print_every == 0:
         param_norm = sum([p.norm()**2 for p in model.parameters()]).item()**0.5
@@ -210,34 +225,48 @@ def main(args):
                       ppl, -ll_diff,
                       param_norm, num_sents / (time.time() - start_time)
                     ))
-        tb.write({'Train ppl': ppl, 'Train word ppl': word_ppl, 'lr': args.lr})
-    logger.info('--------------------------------')
-    logger.info('Checking validation perplexity...')
-    val_loss, val_ppl, val_action_ppl, val_word_ppl = eval_action_ppl(val_data, model)
-    tb.write({'Valid ppl': val_ppl, 'Valid action ppl': val_action_ppl, 'Valid word ppl': val_word_ppl}, epoch)
-    logger.info('--------------------------------')
-    if val_loss < best_val_loss:
-      best_val_loss = val_loss
-      checkpoint = {
-        'args': args.__dict__,
-        'model': model.cpu(),
-        'vocab': train_data.vocab,
-        'prepro_args': train_data.prepro_args,
-        'action_dict': train_data.action_dict
-      }
-      logger.info('Saving checkpoint to {}'.format(args.save_path))
-      torch.save(checkpoint, args.save_path)
-      model.cuda()
+        tb.write({'Train ppl': ppl, 'Train word ppl': word_ppl, 'lr': args.lr}, continuous_epoch)
 
-    def consecutive_increase(target_losses):
-      return all(target_losses[i] < target_losses[i+1] for i in range(0, len(target_losses)-1))
+      if args.valid_every > 0 and global_batch_i % args.valid_every == 0:
+        do_valid(model, optimizer, train_data, val_data, tb, epoch, continuous_epoch, val_losses, args)
 
-    val_losses.append(val_loss)
-    if epoch > args.min_epochs and consecutive_increase(val_losses[-args.decay_cond_epochs-1:]):
-      args.lr = args.decay*args.lr
-      for param_group in optimizer.param_groups:
-        param_group['lr'] = args.lr
+    if args.valid_every <= 0:
+      do_valid(model, optimizer, train_data, val_data, tb, epoch, epoch, val_losses, args)
+
+  # Last validation is necessary when validations were performed intermediately.
+  if args.valid_every > 0:
+    do_valid(model, optimizer, train_data, val_data, tb, epoch, continuous_epoch, val_losses, args)
   logger.info("Finished training!")
+
+def do_valid(model, optimizer, train_data, val_data, tb, epoch, step, val_losses, args):
+  best_val_loss = float('inf') if len(val_losses) == 0 else min(val_losses)
+  logger.info('--------------------------------')
+  logger.info('Checking validation perplexity...')
+  val_loss, val_ppl, val_action_ppl, val_word_ppl = eval_action_ppl(val_data, model)
+  tb.write({'Valid ppl': val_ppl, 'Valid action ppl': val_action_ppl, 'Valid word ppl': val_word_ppl}, step)
+  logger.info('--------------------------------')
+  if val_loss < best_val_loss:
+    best_val_loss = val_loss
+    checkpoint = {
+      'args': args.__dict__,
+      'model': model.cpu(),
+      'vocab': train_data.vocab,
+      'prepro_args': train_data.prepro_args,
+      'action_dict': train_data.action_dict
+    }
+    logger.info('Saving checkpoint to {}'.format(args.save_path))
+    torch.save(checkpoint, args.save_path)
+    model.cuda()
+
+  def consecutive_increase(target_losses):
+    return (len(target_losses) > 0 and
+            all(target_losses[i] < target_losses[i+1] for i in range(0, len(target_losses)-1)))
+
+  val_losses.append(val_loss)
+  if epoch > args.min_epochs and consecutive_increase(val_losses[-args.decay_cond_epochs-1:]):
+    args.lr = args.decay*args.lr
+    for param_group in optimizer.param_groups:
+      param_group['lr'] = args.lr
 
 def eval_action_ppl(data, model):
   model.eval()
