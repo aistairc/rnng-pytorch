@@ -70,10 +70,6 @@ class TestModels(unittest.TestCase):
         model = self._get_simple_top_down_model()
         self._test_transition_batch_2(model)
 
-    def test_top_down_rnng_transition_tied_weight(self):
-        model = self._get_simple_top_down_model(w_dim=10, h_dim=10)
-        self._test_transition_batch_2(model)
-
     def _test_transition_batch_2(self, model):
         x = torch.tensor([[2, 3, 4], [1, 2, 5]])
         states = model.initial_states(x)
