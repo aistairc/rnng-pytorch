@@ -20,6 +20,8 @@ import time
 import logging
 from data import Dataset
 from utils import *
+from in_order_models import InOrderRNNG
+from fixed_stack_in_order_models import FixedStackInOrderRNNG
 
 logger = logging.getLogger('train')
 
@@ -63,6 +65,15 @@ def main(args):
   cuda.set_device(args.gpu)
   model.cuda()
   model.eval()
+
+  if isinstance(model, InOrderRNNG) or isinstance(model, FixedStackInOrderRNNG):
+    # A crude way to modify this parameter, which is set at training, and was previosuly defaulted to 8.
+    # But I noticed that for in-order models, 8 is too much, and it considerably slows down the search.
+    # In practice, for in-order models, max_cons_nts equals max length of unary chains, which, in PTB,
+    # does not exceed 3, though this may be corpus or language specific. Here, I reset it to 3 manually.
+    # For future, if all models are trained on the modified default values (now, in 3), this line could
+    # be deleted.
+    model.max_cons_nts = 3
 
   cur_block_size = 0
 

@@ -16,7 +16,7 @@ class InOrderRNNG(TopDownRNNG):
                dropout = 0,
                attention_composition = False,
                max_open_nts = 100,
-               max_cons_nts = 8,
+               max_cons_nts = 3,
                do_swap_in_rnn = True,
   ):
     super(InOrderRNNG, self).__init__(action_dict, vocab, padding_idx,
