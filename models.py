@@ -118,7 +118,7 @@ class LSTMComposition(nn.Module):
     for b, l in enumerate(lengths):
       elems[b][l-1] = nt[b]
 
-    packed = pack_padded_sequence(elems, lengths, batch_first=True, enforce_sorted=False)
+    packed = pack_padded_sequence(elems, lengths.int().cpu(), batch_first=True, enforce_sorted=False)
     h, _ = self.rnn(packed)
     h, _ = pad_packed_sequence(h, batch_first=True)
 
@@ -664,13 +664,15 @@ class TopDownRNNG(nn.Module):
       reduce_idx = reduces.cpu().numpy()
       reduce_states = [states[i] for i in reduce_idx]
       children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
-      reduce_context = self.stack_top_h(reduce_states)
-      reduce_context = self.stack_to_hidden(reduce_context)
+      if isinstance(self.composition, AttentionComposition):
+        reduce_context = self.stack_top_h(reduce_states)
+        reduce_context = self.stack_to_hidden(reduce_context)
+      else:
+        reduce_context = None
       new_child, _, _ = self.composition(children, ch_lengths, nt, nt_id, reduce_context)
       new_stack_input[reduces] = new_child.float()
 
     new_stack_input[shift_idx] = shifted_embs
-
 
     nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
     nt_embs = self.nt_emb(nt_ids)
