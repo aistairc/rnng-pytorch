@@ -8,81 +8,43 @@ from torch.distributions import Bernoulli
 import itertools
 
 
-# class MultiLayerLSTMCell(nn.Module):
-#   def __init__(self, input_size, hidden_size, num_layers, bias=True, dropout=0):
-#     super(MultiLayerLSTMCell, self).__init__()
-#     self.lstm = nn.ModuleList()
-#     self.lstm.append(nn.LSTMCell(input_size, hidden_size))
-#     for i in range(num_layers-1):
-#       self.lstm.append(nn.LSTMCell(hidden_size, hidden_size))
-#     self.num_layers = num_layers
-#     self.dropout = dropout
-#     self.dropout_layer = nn.Dropout(dropout)
-
-#   def forward(self, input, prev):
-#     """
-
-#     :param input: (batch_size, input_size)
-#     :param prev: tuple of (h0, c0), each has size (batch, hidden_size, num_layers)
-#     """
-
-#     next_hidden = []
-#     next_cell = []
-
-#     if prev is None:
-#         prev = (
-#             input.new(input.size(0), self.lstm[0].hidden_size, self.num_layers).fill_(0),
-#             input.new(input.size(0), self.lstm[0].hidden_size, self.num_layers).fill_(0))
-
-#     for i in range(self.num_layers):
-#       prev_hidden_i = prev[0][:, :, i]
-#       prev_cell_i = prev[1][:, :, i]
-#       if i == 0:
-#         next_hidden_i, next_cell_i = self.lstm[i](input, (prev_hidden_i, prev_cell_i))
-#       else:
-#         input_im1 = self.dropout_layer(input_im1)
-#         next_hidden_i, next_cell_i = self.lstm[i](input_im1, (prev_hidden_i, prev_cell_i))
-#       next_hidden += [next_hidden_i]
-#       next_cell += [next_cell_i]
-#       input_im1 = next_hidden_i
-
-#     next_hidden = torch.stack(next_hidden).permute(1, 2, 0)
-#     next_cell = torch.stack(next_cell).permute(1, 2, 0)
-
-#     return next_hidden, next_cell
-
-
 class MultiLayerLSTMCell(nn.Module):
-  def __init__(self, i_dim, h_dim, num_layers, bias=True, dropout=0):
+  def __init__(self, input_size, hidden_size, num_layers, bias=True, dropout=0):
     super(MultiLayerLSTMCell, self).__init__()
-    self.i_dim = i_dim
-    self.h_dim = h_dim
+    self.lstm = nn.ModuleList()
+    self.lstm.append(nn.LSTMCell(input_size, hidden_size))
+    for i in range(num_layers-1):
+      self.lstm.append(nn.LSTMCell(hidden_size, hidden_size))
     self.num_layers = num_layers
-    self.linears = nn.ModuleList([nn.Linear(h_dim + i_dim, h_dim*4) if l == 0 else
-                                  nn.Linear(h_dim*2, h_dim*4) for l in range(num_layers)])
     self.dropout = dropout
     self.dropout_layer = nn.Dropout(dropout)
 
-  def forward(self, x, prev_h = None):
-    if prev_h is None:
-      prev_h = (x.new(x.size(0), self.h_dim, self.num_layers).fill_(0),
-                x.new(x.size(0), self.h_dim, self.num_layers).fill_(0))
+  def forward(self, input, prev):
+    """
+
+    :param input: (batch_size, input_size)
+    :param prev: tuple of (h0, c0), each has size (batch, hidden_size, num_layers)
+    """
 
     next_hidden = []
     next_cell = []
-    for l in range(self.num_layers):
-      input = x if l == 0 else next_hidden[l-1]
-      if l > 0 and self.dropout > 0:
-        input = self.dropout_layer(input)
-      prev_hidden_i = prev_h[0][:, :, l]
-      prev_cell_i = prev_h[1][:, :, l]
-      concat = torch.cat([input, prev_hidden_i], 1)  # (batch_size, h_dim*2) or (batch_size, h_dim+i_dim)
-      all_sum = self.linears[l](concat)  # (batch_size, h_dim*4)
-      i, f, o, g = all_sum.split(self.h_dim, 1)  # (batch_size, h_dim) for each
-      c = torch.sigmoid(f)*prev_cell_i + torch.sigmoid(i)*torch.tanh(g)
-      h = torch.sigmoid(o)*torch.tanh(c)
-      next_hidden.append(h)
-      next_cell.append(c)
+
+    if prev is None:
+        prev = (
+            input.new(input.size(0), self.lstm[0].hidden_size, self.num_layers).fill_(0),
+            input.new(input.size(0), self.lstm[0].hidden_size, self.num_layers).fill_(0))
+
+    for i in range(self.num_layers):
+      prev_hidden_i = prev[0][:, :, i]
+      prev_cell_i = prev[1][:, :, i]
+      if i == 0:
+        next_hidden_i, next_cell_i = self.lstm[i](input, (prev_hidden_i, prev_cell_i))
+      else:
+        input_im1 = self.dropout_layer(input_im1)
+        next_hidden_i, next_cell_i = self.lstm[i](input_im1, (prev_hidden_i, prev_cell_i))
+      next_hidden += [next_hidden_i]
+      next_cell += [next_cell_i]
+      input_im1 = next_hidden_i
 
     next_hidden = torch.stack(next_hidden).permute(1, 2, 0)
     next_cell = torch.stack(next_cell).permute(1, 2, 0)
@@ -273,34 +235,21 @@ class RNNGCell(nn.Module):
                num_layers,
                dropout,
                action_dict,
-               attention_composition,
-               nt_emb,
-               stack_rnn,
-               stack_to_hidden,
-               composition,
-               initial_emb
-  ):
+               attention_composition):
     super(RNNGCell, self).__init__()
     self.input_size = input_size
     self.hidden_size = hidden_size
     self.num_layers = num_layers
-    # self.dropout = nn.Dropout(dropout)
+    self.dropout = nn.Dropout(dropout)
 
-    ####
-    # self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), input_size), self.dropout)
-    # self.stack_rnn = MultiLayerLSTMCell(input_size, hidden_size, num_layers, dropout=dropout)
-    # self.output = nn.Sequential(self.dropout, nn.Linear(hidden_size, input_size), nn.ReLU())
-    # self.composition = (AttentionComposition(input_size, dropout, self.action_dict.num_nts())
-    #                     if attention_composition else
-    #                     LSTMComposition(input_size, dropout))
+    self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), input_size), self.dropout)
+    self.stack_rnn = MultiLayerLSTMCell(input_size, hidden_size, num_layers, dropout=dropout)
+    self.output = nn.Sequential(self.dropout, nn.Linear(hidden_size, input_size), nn.ReLU())
+    self.composition = (AttentionComposition(input_size, dropout, self.action_dict.num_nts())
+                        if attention_composition else
+                        LSTMComposition(input_size, dropout))
 
-    # self.initial_emb = nn.Sequential(nn.Embedding(1, input_size), self.dropout)
-    self.nt_emb = nt_emb
-    self.stack_rnn = stack_rnn
-    self.output = stack_to_hidden
-    self.composition = composition
-    self.initial_emb = initial_emb
-    ####
+    self.initial_emb = nn.Sequential(nn.Embedding(1, input_size), self.dropout)
 
     self.action_dict = action_dict
 
@@ -346,17 +295,14 @@ class RNNGCell(nn.Module):
         stack_h = None
       new_child, _, _ = self.composition(children, ch_lengths, reduced_nt, reduced_nt_ids, stack_h)
       stack.do_reduce(reduce_batches, new_child)
-      new_input[reduce_batches] = new_child
+      new_input[reduce_batches] = new_child.float()
 
     new_hidden, new_cell = self.stack_rnn(new_input, (stack.hidden_head(1), stack.cell_head(1)))
 
     stack.update_hidden(new_hidden, new_cell)
     # stack.update_nt_counts(actions, self.action_dict)
 
-    ####
-    #return self.output(stack.hidden_head()[:, :, -1])
     return stack.hidden_head()[:, :, -1]
-    ####
 
 class FixedStackRNNG(nn.Module):
   def __init__(self, action_dict,
@@ -382,13 +328,7 @@ class FixedStackRNNG(nn.Module):
     self.emb = nn.Sequential(
       nn.Embedding(vocab, w_dim, padding_idx=padding_idx), self.dropout)
 
-    #### moved here for debug
-    self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), w_dim), self.dropout)
-    self.stack_rnn = MultiLayerLSTMCell(w_dim, h_dim, num_layers=num_layers, dropout=dropout)
-    self.stack_to_hidden = nn.Sequential(self.dropout, nn.Linear(h_dim, w_dim), nn.ReLU())
-    ####
-
-    #self.rnng = RNNGCell(w_dim, h_dim, num_layers, dropout, self.action_dict, attention_composition)
+    self.rnng = RNNGCell(w_dim, h_dim, num_layers, dropout, self.action_dict, attention_composition)
 
     self.vocab_mlp = nn.Linear(w_dim, vocab)
     self.num_layers = num_layers
@@ -398,21 +338,8 @@ class FixedStackRNNG(nn.Module):
     self.hidden_size = h_dim
     self.vocab_mlp.weight = self.emb[0].weight
 
-    ###
-    self.composition = (AttentionComposition(w_dim, dropout, self.action_dict.num_nts())
-                        if attention_composition else
-                        LSTMComposition(w_dim, dropout))
-    ###
-
     self.max_open_nts = max_open_nts
     self.max_cons_nts = max_cons_nts
-
-    ###
-    self.initial_emb = nn.Sequential(nn.Embedding(1, w_dim), self.dropout)
-    ###
-    self.rnng = RNNGCell(w_dim, h_dim, num_layers, dropout, self.action_dict, attention_composition,
-                         self.nt_emb, self.stack_rnn, self.stack_to_hidden, self.composition,
-                         self.initial_emb)
 
   def forward(self, x, actions, initial_stack = None):
     assert isinstance(x, torch.Tensor)
@@ -428,14 +355,12 @@ class FixedStackRNNG(nn.Module):
     return loss, a_loss, w_loss, stack
 
   def unroll_states(self, stack, word_vecs, actions):
-    # hs = word_vecs.new_zeros(actions.size(1), word_vecs.size(0), self.input_size)
-    # hs[0] = self.rnng.output(stack.hidden_head()[:, :, -1])
-    hs = word_vecs.new_zeros(actions.size(1)+1, word_vecs.size(0), self.hidden_size)
+    hs = word_vecs.new_zeros(actions.size(1), word_vecs.size(0), self.hidden_size)
     hs[0] = stack.hidden_head()[:, :, -1]
-    for step in range(actions.size(1)):
+    for step in range(actions.size(1)-1):
       h = self.rnng(word_vecs, actions[:, step], stack)  # (batch_size, input_size)
       hs[step+1] = h
-    hs = self.rnng.output(hs.transpose(1, 0)[:,:-1].contiguous())  # (batch_size, action_len, input_size)
+    hs = self.rnng.output(hs.transpose(1, 0).contiguous())  # (batch_size, action_len, input_size)
     return hs
 
   def build_stack(self, x, batch_size = None):
@@ -485,7 +410,7 @@ class FixedStackRNNG(nn.Module):
     if word_beam_size <= 0:
       word_beam_size = beam_size
 
-    beam = self.initial_beam(x)  # maybe want to calculate scores here.
+    beam = self.initial_beam(x)
     word_completed = [[] for _ in range(x.size(0))]
     word_vecs = self.emb(x)
     word_marginal_ll = [[] for _ in range(x.size(0))]
@@ -589,7 +514,7 @@ class FixedStackRNNG(nn.Module):
     return [[BeamItem.from_initial_state(state)] for state in states]
 
   def initial_states(self, x):
-    initial_hidden = self.rnng.get_initial_hidden(x)  # [(batch_size, hidden_size), (batch_size, hidden_size)]
+    initial_hidden = self.rnng.get_initial_hidden(x)  # [(batch_size, hidden_size, layer), (batch_size, hidden_size, layer)]
     return [TopDownState.from_initial_stack((initial_hidden[0][b], initial_hidden[1][b]))
             for b in range(x.size(0))]
 
@@ -935,7 +860,6 @@ class FixedStackRNNG(nn.Module):
   def _collect_stack_top_context(self, states, idx = None, offset = 1):
     if idx is None:
       idx = range(len(states))
-    stack_h_all = []
     hs = torch.stack([states[i].hiddens[-offset] for i in idx])
     cs = torch.stack([states[i].cells[-offset] for i in idx])
     return hs, cs
