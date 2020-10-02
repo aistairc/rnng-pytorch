@@ -108,8 +108,10 @@ class AttentionComposition(nn.Module):
 
     rhs = torch.cat([self.nt_emb(nt_id), stack_state], dim=1) # (batch_size, w_dim*2, 1)
     logit = (self.V(h)*rhs.unsqueeze(1)).sum(-1)  # equivalent to bmm(self.V(h), rhs.unsqueeze(-1)).squeeze(-1)
-    len_mask = length_to_mask(ch_lengths)
-    logit[len_mask != 1] = -float('inf')
+    len_mask = (ch_lengths.new_zeros(children.size(0), 1) +
+                torch.arange(children.size(1), device=children.device)) >= ch_lengths.unsqueeze(1)
+    logit[len_mask] = -float('inf')
+
     attn = F.softmax(logit)
     weighted_child = (h*attn.unsqueeze(-1)).sum(1)
     weighted_child = self.dropout(weighted_child)
@@ -245,7 +247,7 @@ class RNNGCell(nn.Module):
     self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), input_size), self.dropout)
     self.stack_rnn = MultiLayerLSTMCell(input_size, hidden_size, num_layers, dropout=dropout)
     self.output = nn.Sequential(self.dropout, nn.Linear(hidden_size, input_size), nn.ReLU())
-    self.composition = (AttentionComposition(input_size, dropout, self.action_dict.num_nts())
+    self.composition = (AttentionComposition(input_size, dropout, action_dict.num_nts())
                         if attention_composition else
                         LSTMComposition(input_size, dropout))
 
@@ -289,7 +291,7 @@ class RNNGCell(nn.Module):
     if reduce_batches.size(0) > 0:
       children, ch_lengths, reduced_nt, reduced_nt_ids = stack.collect_reduced_children(reduce_batches)
       if isinstance(self.composition, AttentionComposition):
-        hidden_head = stack.hiddens(batches=reduce_batches)[:, :, -1]
+        hidden_head = stack.hidden_head(batches=reduce_batches)[:, :, -1]
         stack_h = self.output(hidden_head)
       else:
         stack_h = None

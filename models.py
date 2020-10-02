@@ -152,8 +152,9 @@ class AttentionComposition(nn.Module):
 
     rhs = torch.cat([self.nt_emb(nt_id), stack_state], dim=1) # (batch_size, w_dim*2, 1)
     logit = (self.V(h)*rhs.unsqueeze(1)).sum(-1)  # equivalent to bmm(self.V(h), rhs.unsqueeze(-1)).squeeze(-1)
-    len_mask = length_to_mask(ch_lengths)
-    logit[len_mask != 1] = -float('inf')
+    len_mask = (ch_lengths.new_zeros(children.size(0), 1) +
+                torch.arange(children.size(1), device=children.device)) >= ch_lengths.unsqueeze(1)
+    logit[len_mask] = -float('inf')
     attn = F.softmax(logit)
     weighted_child = (h*attn.unsqueeze(-1)).sum(1)
     weighted_child = self.dropout(weighted_child)
