@@ -112,7 +112,7 @@ class AttentionComposition(nn.Module):
                 torch.arange(children.size(1), device=children.device)) >= ch_lengths.unsqueeze(1)
     logit[len_mask] = -float('inf')
 
-    attn = F.softmax(logit)
+    attn = F.softmax(logit, -1)
     weighted_child = (h*attn.unsqueeze(-1)).sum(1)
     weighted_child = self.dropout(weighted_child)
 
@@ -125,86 +125,97 @@ class AttentionComposition(nn.Module):
 
 
 class FixedStack:
-  def __init__(self, initial_hidden, stack_size, input_size):
-    batch_size = initial_hidden[0].size(0)
+  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
     device = initial_hidden[1].device
     hidden_size = initial_hidden[0].size(-2)
     num_layers = initial_hidden[0].size(-1)
 
+    if beam_size == 1:
+      batch_size = (initial_hidden[0].size(0),)
+      self.batch_index = (torch.arange(0, batch_size[0], dtype=torch.long, device=device),)
+    else:
+      batch_size = (initial_hidden[0].size(0), beam_size)
+      self.batch_index = ((torch.arange(0, batch_size[0], dtype=torch.long, device=device)
+                           .unsqueeze(1).expand(-1, beam_size).reshape(-1)),
+                          torch.cat([torch.arange(0, beam_size, dtype=torch.long, device=device)
+                                     for _ in range(batch_size[0])]))
+
+    self.batch_size = initial_hidden[0].size(0)
+    self.beam_size = beam_size
+
     self.pointer = torch.zeros(batch_size, dtype=torch.long, device=device)  # word pointer
     self.top_position = torch.zeros(batch_size, dtype=torch.long, device=device)  # stack top position
-    self.hiddens = torch.zeros(batch_size, stack_size+1, hidden_size, num_layers, device=device)
-    self.cells = torch.zeros(batch_size, stack_size+1, hidden_size, num_layers, device=device)
-    self.trees = torch.zeros(batch_size, stack_size, input_size, device=device)
+    self.hiddens = torch.zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
+    self.cells = torch.zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
+    self.trees = torch.zeros(batch_size + (stack_size, input_size), device=device)
 
-    self.batch_index = torch.arange(0, batch_size, dtype=torch.long, device=device)
+    if beam_size == 1:
+      self.hiddens[:, 0] = initial_hidden[0].float()
+      self.cells[:, 0] = initial_hidden[1].float()
+    else:
+      # Only fill zero-th beam position because we do not other beam elems at beginning of search.
+      self.hiddens[:, 0, 0] = initial_hidden[0].float()
+      self.cells[:, 0, 0] = initial_hidden[1].float()
 
-    self.hiddens[self.batch_index, 0, :, :] = initial_hidden[0].float()
-    self.cells[self.batch_index, 0, :, :] = initial_hidden[1].float()
-
-    self.nt_index = torch.zeros(batch_size, stack_size, dtype=torch.long, device=device)
-    self.nt_ids = torch.zeros(batch_size, stack_size, dtype=torch.long, device=device)
-    self.nt_index_pos = torch.tensor([-1]*batch_size, dtype=torch.long, device=device) # default is -1 (0 means zero-dim exists)
-
-    self.nopen_parens = [0] * batch_size
-    self.ncons_nts = [0] * batch_size
+    self.nt_index = torch.zeros(batch_size + (stack_size,), dtype=torch.long, device=device)
+    self.nt_ids = torch.zeros(batch_size + (stack_size,), dtype=torch.long, device=device)
+    self.nt_index_pos = torch.tensor([-1], dtype=torch.long, device=device).expand(batch_size).clone() # default is -1 (0 means zero-dim exists)
 
   def hidden_head(self, offset = 0, batches = None):
     assert offset >= 0
     if batches is None:
-      return self.hiddens[self.batch_index, self.top_position-offset, :, :]  # (batch_size, hidden_size, num_layers)
+      return self.hiddens[self.batch_index + (self.top_position.view(-1)-offset,)]
     else:
-      return self.hiddens[batches, self.top_position[batches]-offset, :, :]
+      return self.hiddens[batches + (self.top_position[batches]-offset,)]
 
   def cell_head(self, offset = 0, batches = None):
     assert offset >= 0
     if batches is None:
-      return self.cells[self.batch_index, self.top_position-offset, :, :]  # (batch_size, hidden_size, num_layers)
+      return self.cells[self.batch_index + ((self.top_position.view(-1)-offset),)]
     else:
-      return self.cells[batches, self.top_position[batches]-offset, :, :]
+      return self.cells[batches + (self.top_position[batches]-offset,)]
 
   def do_shift(self, shift_batches, shifted_embs):
-    self.trees[shift_batches, self.top_position[shift_batches], :] = shifted_embs
-    self.pointer[shift_batches] = self.pointer[shift_batches] + 1  # part of do_action is done here
+    self.trees[shift_batches + (self.top_position[shift_batches],)] = shifted_embs
+    self.pointer[shift_batches] = self.pointer[shift_batches] + 1
     self.top_position[shift_batches] = self.top_position[shift_batches] + 1
 
   def do_nt(self, nt_batches, nt_embs, nt_ids):
-    self.trees[nt_batches, self.top_position[nt_batches], :] = nt_embs
+    self.trees[nt_batches + (self.top_position[nt_batches],)] = nt_embs
 
     self.nt_index_pos[nt_batches] = self.nt_index_pos[nt_batches] + 1
-    self.nt_ids[nt_batches, self.nt_index_pos[nt_batches]] = nt_ids
+    self.nt_ids[nt_batches + (self.nt_index_pos[nt_batches],)] = nt_ids
     self.top_position[nt_batches] = self.top_position[nt_batches] + 1
-    self.nt_index[nt_batches, self.nt_index_pos[nt_batches]] = self.top_position[nt_batches]
+    self.nt_index[nt_batches + (self.nt_index_pos[nt_batches],)] = self.top_position[nt_batches]
 
   def do_reduce(self, reduce_batches, new_child):
-    prev_nt_position = self.nt_index[reduce_batches, self.nt_index_pos[reduce_batches]]
-    self.trees[reduce_batches, prev_nt_position-1] = new_child.float()
+    prev_nt_position = self.nt_index[reduce_batches + (self.nt_index_pos[reduce_batches],)]
+    self.trees[reduce_batches + (prev_nt_position-1,)] = new_child.float()
     self.nt_index_pos[reduce_batches] = self.nt_index_pos[reduce_batches] - 1
     self.top_position[reduce_batches] = prev_nt_position
 
   def collect_reduced_children(self, reduce_batches):
-    # Let us collect:
-    #   reduced_nt_ids: (reduce_batch_size, 1)
-    #   reduced_nts: (reduce_batch_size, input_size)
-    #   reduced_children: (reduce_batch_size, max_child_len (padded), input_size)
-    #   child_length: (reduce_batch_size, 1)
+    """
+
+    :param reduce_batches: Tuple of idx tensors (output of non_zero()).
+    """
     nt_index_pos = self.nt_index_pos[reduce_batches]
-    prev_nt_position = self.nt_index[reduce_batches, nt_index_pos]
-    reduced_nt_ids = self.nt_ids[reduce_batches, nt_index_pos]
-    reduced_nts = self.trees[reduce_batches, prev_nt_position-1]
+    prev_nt_position = self.nt_index[reduce_batches + (nt_index_pos,)]
+    reduced_nt_ids = self.nt_ids[reduce_batches + (nt_index_pos,)]
+    reduced_nts = self.trees[reduce_batches + (prev_nt_position-1,)]
     child_length = self.top_position[reduce_batches] - prev_nt_position
     max_ch_length = child_length.max()
 
     child_idx = prev_nt_position.unsqueeze(1) + torch.arange(max_ch_length, device=prev_nt_position.device)
     child_idx[child_idx >= self.trees.size(1)] = self.trees.size(1) - 1  # ceiled at maximum stack size (exceeding this may occur for some batches, but those should be ignored safely.)
-    child_idx = child_idx.unsqueeze(2).expand(-1, -1, self.trees.size(-1))
+    child_idx = child_idx.unsqueeze(-1).expand(-1, -1, self.trees.size(-1))  # (num_reduced_batch, max_num_child, input_dim)
     reduced_children = torch.gather(self.trees[reduce_batches], 1, child_idx)
     return reduced_children, child_length, reduced_nts, reduced_nt_ids
 
   def update_hidden(self, new_hidden, new_cell):
-    pos = self.top_position.clone()
-    self.hiddens[self.batch_index, pos, :, :] = new_hidden.float()
-    self.cells[self.batch_index, pos, :, :] = new_cell.float()
+    pos = self.top_position.reshape(-1).clone()
+    self.hiddens[self.batch_index + (pos,)] = new_hidden.float()
+    self.cells[self.batch_index + (pos,)] = new_cell.float()
 
   def reset_stack(self):
     # may be useful for reusing stack.
@@ -267,28 +278,27 @@ class RNNGCell(nn.Module):
     :param actions: (batch_size, 1)
     """
 
-    reduce_batches = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
-    nt_batches = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
-    shift_batches = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
+    reduce_batches = (actions == self.action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
+    nt_batches = (actions >= self.action_dict.nt_begin_id()).nonzero(as_tuple=True)
+    shift_batches = (actions == self.action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
 
-    new_input = word_vecs.new_zeros(word_vecs.size(0), self.input_size)
+    new_input = word_vecs.new_zeros(stack.hiddens.size()[:-3] + (self.input_size,))
 
     # First fill in trees. Then, gather those added elements in a column, which become
     # the input to stack_rnn.
-    if shift_batches.size(0) > 0:
-      # this part should be one method? (to change behavior in a child class)
+    if shift_batches[0].size(0) > 0:
       shift_idx = stack.pointer[shift_batches].view(-1, 1, 1).expand(-1, 1, word_vecs.size(-1))
-      shifted_embs = torch.gather(word_vecs[shift_batches], 1, shift_idx).squeeze(1)
+      shifted_embs = torch.gather(word_vecs[shift_batches[0]], 1, shift_idx).squeeze(1)
       stack.do_shift(shift_batches, shifted_embs)
       new_input[shift_batches] = shifted_embs
 
-    if nt_batches.size(0) > 0:
+    if nt_batches[0].size(0) > 0:
       nt_ids = (actions[nt_batches] - self.action_dict.nt_begin_id())
       nt_embs = self.nt_emb(nt_ids)
       stack.do_nt(nt_batches, nt_embs, nt_ids)
       new_input[nt_batches] = nt_embs
 
-    if reduce_batches.size(0) > 0:
+    if reduce_batches[0].size(0) > 0:
       children, ch_lengths, reduced_nt, reduced_nt_ids = stack.collect_reduced_children(reduce_batches)
       if isinstance(self.composition, AttentionComposition):
         hidden_head = stack.hidden_head(batches=reduce_batches)[:, :, -1]
@@ -299,12 +309,13 @@ class RNNGCell(nn.Module):
       stack.do_reduce(reduce_batches, new_child)
       new_input[reduce_batches] = new_child.float()
 
-    new_hidden, new_cell = self.stack_rnn(new_input, (stack.hidden_head(1), stack.cell_head(1)))
+    # Input for rnn should be (beam_size, input_size). During beam search, new_input has different size.
+    new_hidden, new_cell = self.stack_rnn(new_input.view(-1, self.input_size),
+                                          (stack.hidden_head(1), stack.cell_head(1)))
 
     stack.update_hidden(new_hidden, new_cell)
-    # stack.update_nt_counts(actions, self.action_dict)
 
-    return stack.hidden_head()[:, :, -1]
+    return stack.hidden_head()[..., -1]
 
 class FixedStackRNNG(nn.Module):
   def __init__(self, action_dict,
