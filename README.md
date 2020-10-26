@@ -1,102 +1,58 @@
-# Unsupervised Recurrent Neural Network Grammars
-
-This is an implementation of the paper:  
-[Unsupervised Recurrent Neural Network Grammars](https://arxiv.org/abs/1904.03746)  
-Yoon Kim, Alexander Rush, Lei Yu, Adhiguna Kuncoro, Chris Dyer, Gabor Melis  
-NAACL 2019  
+# PyTorch-based Fully Tensorized Recurrent Neural Network Grammars (RNNGs)
 
 ## Dependencies
-The code was tested in `python 3.6` and `pytorch 1.0`.
+Most of the code should work with PyTorch 1.5 or above. However, if you use mixed-precision training (with `--amp` option), you need to install nightly-version of PyTorch (`pytorch-nightly`), which resolved some tricly bugs around AMP with version `1.6`.
 
-## Data  
-Sample train/val/test data is in the `data/` folder. These are the standard datasets from PTB.
-First preprocess the data:
+## Data
+We first convert a PTB-style dataset (examples found in `data/` folder) into a single json file by preprocessing, which converts each parse tree into tokens, ids (after unkifying), oracle actions, etc:
 ```
-python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
---outputfile data/ptb --vocabminfreq 1 --lowercase 0 --replace_num 0 --batchsize 16
+$ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
+--outputfile data/ptb --vocabminfreq 1 --unkmethod berkeleyrule
 ```
-Running this will save the following files in the `data/` folder: `ptb-train.pkl`, `ptb-val.pkl`,
-`ptb-test.pkl`, `ptb.dict`. Here `ptb.dict` is the word-idx mapping, and you can change the
-output folder/name by changing the argument to `outputfile`. Also, the preprocessing here
-will replace singletons with a single `<unk>` rather than with Berkeley parser's mapping rules
-(see below for results using this setup).
+By `--unkmethod berkeleyrule`, a unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indidates an unknown token ending with `ly` suffix (e.g., nominally).
+
+The outputs are `data/ptb-train.json`, `data/ptb-val.json`, and `data/ptb-test.json`. Vocabulary is defined by tokens in the training data. Which tokens to include in the vocabulary is decided by `--vocabminfreq` or `--vocabsize` argument (see `python preprocess.py --help`).
 
 ## Training
-To train the URNNG:
-```
-python train.py --train_file data/ptb-train.pkl --val_file data/ptb-val.pkl --save_path urnng.pt 
---mode unsupervised --gpu 0
-```
-where `save_path` is where you want to save the model, and `gpu 0` is for using the first GPU
-in the cluster (the mapping from PyTorch GPU index to your cluster's GPU index may vary).
-Training should take 2 to 3 days depending on your setup.
+The current implementation is hard-coded for running on a single GPU.
 
-To train the RNNG:
+Example to train a model:
 ```
-python train.py --train_file data/ptb-train.pkl --val_file data/ptb-val.pkl --save_path rnng.pt 
---mode supervised --train_q_epochs 18 --gpu 0 
+$ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json --save_path rnng.pt
+--fixed_stack --strategy top_down --dropout 0.3 --optimizer adam --lr 0.01 --gpu 0
 ```
 
-For fine-tuning:
-```
-python train.py --train_from rnng.pt --train_file data/ptb-train.pkl --val_file data/ptb-val.pkl 
---save_path rnng-urnng.pt --mode unsupervised --lr 0.1 --train_q_epochs 10 --epochs 10 
---min_epochs 6 --gpu 0 --kl_warmup 0
-```
+### Training Tips
 
-To train the LM:
-```
-python train_lm.py --train_file data/ptb-train.pkl --val_file data/ptb-val.pkl 
---test_file data/ptb-test.pkl --save_path lm.pt 
-```
+- I recomment to use `adam` optimizer instead of `sgd`. Although the original paper reports the results with SGD, I found that Adam works much more stable for this implementation.
+- `--lr` and `--dropout` have a large impact on the performance and should be tuned on each dataset.
+- Training becomes faster by a larger batch size (e.g., `--batch_size 128`) but the impact to final performance is not fully investigated. For modest amount of data (e.g., English PTB, ~1M tokens), `--batch_size 64` seems to work well.
+- `--fixed_stack` is always recommended. Without this, the training will be done by the older code that is not fully tensorized and thus slow.
+
+### Parsing strategies
+
+The above example specifies `--strategy top_down`, which means a parse tree is predicted by completely top-down. In addition to this, we also provide in-order strategy (`--strategy in_order`), which is almost the same as the left-corner strategy in [Kuncoro et al. (2018)](https://www.aclweb.org/anthology/P18-1132/).
 
 ## Evaluation
-To evaluate perplexity with importance sampling on the test set:
-```
-python eval_ppl.py --model_file urnng.pt --test_file data/ptb-test.pkl --samples 1000 
---is_temp 2 --gpu 0
-```
-The argument `samples` is for the number of importance weighted samples, and `is_temp` is for
-flattening the inference network's distribution (footnote 14 in the paper).
-The same evaluation code will work for RNNG. 
+We provide word-synchronous beam search and [particle filter](https://www.aclweb.org/anthology/D19-1106/) for search method at test time. These allows to obtain 1-best parse as well as perplexity as a fully-incremental language model.
 
-For LM evaluation:
+Running word-synchronous beam search:
 ```
-python train_lm.py --train_from lm.pt --test_file data/ptb-test.pkl --test 1
+$ head -n 3 test.tokens
+Influential members of the House Ways and Means Committee introduced legislation that would restrict how the new savings-and-loan bailout agency can raise capital , creating another potential obstacle to the government 's sale of sick thrifts .
+The bill , whose backers include Chairman Dan Rostenkowski -LRB- D. , Ill. -RRB- , would prevent the Resolution Trust Corp. from raising temporary working capital by having an RTC-owned bank or thrift issue debt that would n't be counted on the federal budget .
+The bill intends to restrict the RTC to Treasury borrowings only , unless the agency receives specific congressional authorization .
+
+$ python beam_search.py --test_file valid.tokens --model_file rnng.pt --batch_size 20 --beam_size 100
+--word_beam_size 10 --shift_size 1 --block_size 1000 --gpu 0 --lm_output_file surprisals.txt > valid.parsed
 ```
 
-To evaluate F1, first we need to parse the test set:
+`--beam_size`, `--word_beam_size`, and `--shift_size` are three sizes specifying the behavior of word synchronous beam search, corresponding to beam size for transitions between two tokens, beam size saved at each word boundary, and number of beam actions forcefully shifted at each step (i.e., fast-track).
+
+`--block_size` is the number of sentences in a pool, from which mini-baches of sentences are created. Output is dumped after processing every this many sentences.
+
+Alternately, you can search with particle filtering rather than fixed size beam search:
 ```
-python parse.py --model_file urnng.pt --data_file data/ptb-test.txt --out_file pred-parse.txt 
---gold_out_file gold-parse.txt --gpu 0
+$ python beam_search.py --test_file valid.tokens --model_file rnng.pt --batch_size 20 --particle_filter
+--particle_size 1000 --gpu 0 --lm_output_file surprisals.txt > valid.parsed
 ```
-This will output the predicted parse trees into `pred-parse.txt`. We also output a version
-of the gold parse `gold-parse.txt` to be used as input for `evalb`, since sentences with only trivial spans are ignored by `parse.py`. Note that corpus/sentence F1 results printed here do not correspond to the results reported in the paper, since it does not ignore punctuation. 
-
-Finally, download/install `evalb`, available [here](https://nlp.cs.nyu.edu/evalb).
-Then run:
-```
-evalb -p COLLINS.prm gold-parse.txt test-parse.txt
-```
-where `COLLINS.prm` is the parameter file (provided in this repo) that tells `evalb` to ignore
-punctuation and evaluate on unlabeled F1.
-
-## Note Regarding Preprocessing
-Note that some of the details regarding the preprocessing is slightly different from the original 
-paper. In particular, in this implementation we replace singleton words a single `<unk>` token
-instead of using Berkeley parser's mapping rules. This results in slight lower perplexity
-for all models, since the vocabulary size is smaller. Here are the perplexty numbers I get
-in this setting:
-
-- RNNLM: 89.2 
-- RNNG: 83.7 
-- URNNG: 85.1 (F1: 38.4) 
-- RNNG --> URNNG: 82.5
-
-## Acknowledgements
-Some of our preprocessing and evaluation code is based on the following repositories:  
-- [Recurrent Neural Network Grammars](https://github.com/clab/rnng)  
-- [Parsing Reading Predict Network](https://github.com/yikangshen/PRPN)  
-
-## License
-MIT

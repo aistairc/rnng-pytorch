@@ -37,17 +37,18 @@ parser.add_argument('--train_from', default='')
 # Model options
 parser.add_argument('--fixed_stack', action='store_true')
 parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
-parser.add_argument('--w_dim', default=650, type=int, help='input/output word dimension')
-parser.add_argument('--h_dim', default=650, type=int, help='LSTM hidden dimension')
+parser.add_argument('--w_dim', default=256, type=int, help='input/output word dimension')
+parser.add_argument('--h_dim', default=256, type=int, help='LSTM hidden dimension')
 parser.add_argument('--num_layers', default=2, type=int, help='number of layers in LM and the stack LSTM (for RNNG)')
 parser.add_argument('--dropout', default=0.5, type=float, help='dropout rate')
 parser.add_argument('--composition', default='lstm', choices=['lstm', 'attention'],
                     help='lstm: original lstm composition; attention: gated attention introduced in Kuncoro et al. (2017).')
 parser.add_argument('--not_swap_in_order_stack', action='store_true',
-                    help='If True, prevent swapping elements by an open action for the in-order system.')
+                    help=('If True, prevent swapping elements by an open action for the in-order system.'
+                          'WARNING: when --fixed_stack is True, this option is automatically and always set to True (obsolete option and no need to care)'))
 # Optimization options
 parser.add_argument('--optimizer', choices=['sgd', 'adam'], help='Which optimizer to use.')
-parser.add_argument('--no_random_unk', action='store_true', help='Prohibit to randomly replace a token to <unk> on training sentences (in default, randomly replace).')
+parser.add_argument('--random_unk', action='store_true', help='Randomly replace a token to <unk> on training sentences by a probability inversely proportional to word frequency.')
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--save_path', default='rnng.pt', help='where to save the best model')
 parser.add_argument('--num_epochs', default=18, type=int, help='number of training epochs')
@@ -116,7 +117,7 @@ def main(args):
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
   torch.cuda.manual_seed(args.seed)
-  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=not args.no_random_unk,
+  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=args.random_unk,
                                  oracle=args.strategy)
   vocab = train_data.vocab
   action_dict = train_data.action_dict
