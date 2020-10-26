@@ -9,7 +9,7 @@ We first convert a PTB-style dataset (examples found in `data/` folder) into a s
 $ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
 --outputfile data/ptb --vocabminfreq 1 --unkmethod berkeleyrule
 ```
-By `--unkmethod berkeleyrule`, a unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indidates an unknown token ending with `ly` suffix (e.g., nominally).
+By `--unkmethod berkeleyrule`, an unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indidates an unknown token ending with `ly` suffix (e.g., nominally).
 
 The outputs are `data/ptb-train.json`, `data/ptb-val.json`, and `data/ptb-test.json`. Vocabulary is defined by tokens in the training data. Which tokens to include in the vocabulary is decided by `--vocabminfreq` or `--vocabsize` argument (see `python preprocess.py --help`).
 
@@ -26,15 +26,16 @@ $ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json 
 
 - I recomment to use `adam` optimizer instead of `sgd`. Although the original paper reports the results with SGD, I found that Adam works much more stable for this implementation.
 - `--lr` and `--dropout` have a large impact on the performance and should be tuned on each dataset.
-- Training becomes faster by a larger batch size (e.g., `--batch_size 128`) but the impact to final performance is not fully investigated. For modest amount of data (e.g., English PTB, ~1M tokens), `--batch_size 64` seems to work well.
+- Training becomes faster by a larger batch size (e.g., `--batch_size 128`) but the impact to the final performance is not fully investigated. For modest amount of data (e.g., English PTB, ~1M tokens), `--batch_size 64` seems to work well.
 - `--fixed_stack` is always recommended. Without this, the training will be done by the older code that is not fully tensorized and thus slow.
 
 ### Parsing strategies
 
-The above example specifies `--strategy top_down`, which means a parse tree is predicted by completely top-down. In addition to this, we also provide in-order strategy (`--strategy in_order`), which is almost the same as the left-corner strategy in [Kuncoro et al. (2018)](https://www.aclweb.org/anthology/P18-1132/).
+The above example specifies `--strategy top_down`, which means a parse tree is predicted completely top-down. In addition to this, we also provide the in-order strategy (`--strategy in_order`), which is almost the same as the left-corner strategy in [Kuncoro et al. (2018)](https://www.aclweb.org/anthology/P18-1132/).
+Terminological issue: I use the term "in-order" to mean "arc-standard left-corner", signifying the difference from "arc-eager left-corner".
 
 ## Evaluation
-We provide word-synchronous beam search and [particle filter](https://www.aclweb.org/anthology/D19-1106/) for search method at test time. These allows to obtain 1-best parse as well as perplexity as a fully-incremental language model.
+We provide word-synchronous beam search and [particle filter](https://www.aclweb.org/anthology/D19-1106/) for search method at test time. These allow to obtain 1-best parse as well as perplexity as a fully-incremental language model.
 
 Running word-synchronous beam search:
 ```
