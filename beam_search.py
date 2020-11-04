@@ -36,6 +36,7 @@ parser.add_argument('--word_beam_size', type=int, default=20)
 parser.add_argument('--shift_size', type=int, default=5)
 parser.add_argument('--batch_size', type=int, default=5)
 parser.add_argument('--block_size', type=int, default=100)
+parser.add_argument('--batch_token_size', type=int, default=300)
 parser.add_argument('--delay_word_ll', action='store_true',
                     help='Adding shift word probability is delayed at word-synchronizing step')
 parser.add_argument('--particle_filter', action='store_true', help='search with particle filter')
@@ -46,7 +47,7 @@ parser.add_argument('--dump_beam', action='store_true',
                     help='(For debug and model development) print out all states in the beam at each step')
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int)
-
+parser.add_argument('--amp', action='store_true')
 
 def main(args):
   np.random.seed(args.seed)
@@ -59,7 +60,7 @@ def main(args):
 
   # todo: add tagger.
   dataset = Dataset.from_text_file(args.test_file, args.batch_size, vocab, action_dict,
-                                   prepro_args = prepro_args)
+                                   prepro_args = prepro_args, batch_token_size = args.batch_token_size)
   logger.info("model architecture")
   logger.info(model)
   cuda.set_device(args.gpu)
@@ -116,15 +117,16 @@ def main(args):
     block_parses = []
     block_surprisals = []
     batches = [batch for batch in dataset.test_batches(args.block_size)]
+
     for batch in tqdm(batches):
       tokens, batch_idx = batch
       tokens = tokens.cuda()
-
-      if args.dump_beam:
-        parses, surprisals, beam_history = parse(model, tokens, True)
-        dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
-      else:
-        parses, surprisals = parse(model, tokens, False)
+      with torch.cuda.amp.autocast(enabled=args.amp):
+        if args.dump_beam:
+          parses, surprisals, beam_history = parse(model, tokens, True)
+          dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
+        else:
+          parses, surprisals = parse(model, tokens, False)
 
       best_actions = [p[0][0] for p in parses]  # p[0][1] is likelihood
       trees = [action_dict.build_tree_str(best_actions[i],

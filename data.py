@@ -149,9 +149,11 @@ class Sentence(object):
             'tree_str': self.tree_str}
 
 class Dataset(object):
-  def __init__(self, sents, batch_size, vocab, action_dict, random_unk=False, prepro_args={}):
+  def __init__(self, sents, batch_size, vocab, action_dict, random_unk=False, prepro_args={},
+               batch_token_size = 10000000):
     self.sents = sents
     self.batch_size = batch_size
+    self.batch_token_size = batch_token_size  # This bounds the batch size by the number of tokens.
     self.vocab = vocab
     self.action_dict = action_dict
     self.random_unk = random_unk
@@ -185,8 +187,8 @@ class Dataset(object):
     return Dataset(sents, batch_size, vocab, action_dict, random_unk, j['args'])
 
   @staticmethod
-  def from_text_file(text_file, batch_size, vocab, action_dict, tagger_fn=None,
-                     prepro_args = {}):
+  def from_text_file(text_file, batch_size, vocab, action_dict, tagger_fn = None,
+                     prepro_args = {}, batch_token_size = 10000000):
     """tagger_fn is a function receiving a sentence and returning POS tags.
     If Not provided, dummy tags (X) are provided.
     """
@@ -204,7 +206,7 @@ class Dataset(object):
         tags = tagger_fn(tokens)
         sent = Sentence(orig_tokens, tokens, token_ids, tags)
         sents.append(sent)
-    return Dataset(sents, batch_size, vocab, action_dict, False, prepro_args)
+    return Dataset(sents, batch_size, vocab, action_dict, False, prepro_args, batch_token_size)
 
   def get_num_batches(self):
     b = 0
@@ -258,8 +260,10 @@ class Dataset(object):
     for length, idxs in len_to_idxs.items():
       if shuffle:
         idxs = np.random.permutation(idxs)
-      for begin in range(0, len(idxs), self.batch_size):
-        batches.append(idxs[begin:begin+self.batch_size])
+      batch_size_by_token = self.batch_token_size // length
+      batch_size = max(min(self.batch_size, batch_size_by_token), 1)
+      for begin in range(0, len(idxs), batch_size):
+        batches.append(idxs[begin:begin+batch_size])
     if shuffle:
         batches = np.random.permutation(batches)
 
