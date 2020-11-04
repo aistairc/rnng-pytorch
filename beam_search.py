@@ -159,8 +159,8 @@ def main(args):
         o.write('{}\t{}\t{}\t{}\t{}\n'.format(sent_i, t_i, orig_t, mod_t, s))
     o.write('-----------------------------------\n')
 
-    ll = -sum([sum(surp) for surp in surprisals])
-    num_words = sum([len(surp) for surp in surprisals])
+    ll = -sum([sum(surp) for surp in all_surprisals])
+    num_words = sum([len(surp) for surp in all_surprisals])
     ppl = np.exp(-ll / num_words)
     o.write('perplexity: {}'.format(ppl))
 
