@@ -252,11 +252,45 @@ class FixedStack:
     self.nt_index_pos[self_move_idxs] = other.nt_index_pos[move_idxs]
 
 
+class StackState:
+  def __init__(self, batch_size, beam_size, device):
+    """Keep track of information about states that is strategy-dependent, including
+    ncons_nts, for which how to update it will depend on the strategy.
+
+    Structures other than FixedStack and StackState preserved in BeamItems would be
+    strategy-invariant.
+
+    """
+
+    self.ncons_nts = torch.zeros((batch_size, beam_size), dtype=torch.long, device=device)
+    self.nopen_parens = torch.zeros((batch_size, beam_size), dtype=torch.long, device=device)
+
+  def move_beams(self, self_idxs, source, source_idxs):
+    self.ncons_nts[self_idxs] = source.ncons_nts[source_idxs]
+    self.nopen_parens[self_idxs] = source.nopen_parens[source_idxs]
+
+  def sort_by(self, sort_idx):
+    self.ncons_nts = torch.gather(self.ncons_nts, 1, sort_idx)
+    self.nopen_parens = torch.gather(self.nopen_parens, 1, sort_idx)
+
+  def update_nt_counts(self, actions, action_dict):
+    shift_idxs = (actions == action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
+    nt_idxs = (actions >= action_dict.nt_begin_id()).nonzero(as_tuple=True)
+    reduce_idxs = (actions == action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
+
+    self.ncons_nts[shift_idxs] = 0
+    self.nopen_parens[nt_idxs] += 1
+    self.ncons_nts[nt_idxs] += 1
+    self.nopen_parens[reduce_idxs] -= 1
+    self.ncons_nts[reduce_idxs] = 0
+
+
 class BeamItems:
-  def __init__(self, stack, max_actions = 500, beam_is_empty = False):
+  def __init__(self, stack, stack_state, max_actions = 500, beam_is_empty = False):
     self.batch_size = stack.batch_size
     self.beam_size = stack.beam_size
     self.stack = stack
+    self.stack_state = stack_state
 
     self.gen_ll = torch.tensor([-float('inf')], device=stack.hiddens.device).expand(
       self.batch_size, self.beam_size).clone()
@@ -271,11 +305,16 @@ class BeamItems:
     else:
       self.beam_widths = self.gen_ll.new_ones(self.batch_size, dtype=torch.long)
 
-    self.ncons_nts = self.beam_widths.new_zeros((self.batch_size, self.beam_size))
-    self.nopen_parens = self.beam_widths.new_zeros((self.batch_size, self.beam_size))
-
     self.actions = self.beam_widths.new_full((self.batch_size, self.beam_size, max_actions), -1)
     self.actions_pos = self.beam_widths.new_zeros(self.batch_size, self.beam_size)
+
+  @property
+  def ncons_nts(self):
+    return self.stack_state.ncons_nts
+
+  @property
+  def nopen_parens(self):
+    return self.stack_state.nopen_parens
 
   def prev_actions(self):
     return self.actions.gather(2, self.actions_pos.unsqueeze(-1)).squeeze(-1)  # (batch_size, beam_size)
@@ -284,7 +323,6 @@ class BeamItems:
     widths = self.beam_widths.cpu().numpy()
     actions = self.actions.cpu().numpy()
     actions_pos = self.actions_pos.cpu().numpy()
-
     def tree_actions(batch, beam):
       return (actions[batch, beam, 1:actions_pos[batch, beam]+1], self.gen_ll[batch, beam].item())
 
@@ -300,9 +338,8 @@ class BeamItems:
     self.gen_ll, sort_idx = torch.sort(self.gen_ll, descending=True)
     self.disc_ll = torch.gather(self.disc_ll, 1, sort_idx)
     self.stack.sort_by(sort_idx)
+    self.stack_state.sort_by(sort_idx)
     self.beam_widths = torch.min(self.beam_widths, self.beam_widths.new_tensor([size]))
-    self.ncons_nts = torch.gather(self.ncons_nts, 1, sort_idx)
-    self.nopen_parens = torch.gather(self.nopen_parens, 1, sort_idx)
 
     self.actions = torch.gather(self.actions, 1, sort_idx.unsqueeze(-1).expand(self.actions.size()))
     self.actions_pos = torch.gather(self.actions_pos, 1, sort_idx)
@@ -405,8 +442,7 @@ class BeamItems:
     self.gen_ll[self_idxs] = new_gen_ll if new_gen_ll is not None else source.gen_ll[source_idxs]
     self.disc_ll[self_idxs] = new_disc_ll if new_disc_ll is not None else source.disc_ll[source_idxs]
 
-    self.ncons_nts[self_idxs] = source.ncons_nts[source_idxs]
-    self.nopen_parens[self_idxs] = source.nopen_parens[source_idxs]
+    self.stack_state.move_beams(self_idxs, source.stack_state, source_idxs)
     self.stack.move_beams(self_idxs, source.stack, source_idxs)
 
     self.actions[self_idxs] = source.actions[source_idxs]
@@ -417,18 +453,8 @@ class BeamItems:
     self.actions_pos[active_idxs] += 1
     self.actions[active_idxs + (self.actions_pos[active_idxs],)] = actions[active_idxs]
 
-    self._update_nt_counts(actions, action_dict)
+    self.stack_state.update_nt_counts(actions, action_dict)
 
-  def _update_nt_counts(self, actions, action_dict):
-    shift_idxs = (actions == action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
-    nt_idxs = (actions >= action_dict.nt_begin_id()).nonzero(as_tuple=True)
-    reduce_idxs = (actions == action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
-
-    self.ncons_nts[shift_idxs] = 0
-    self.nopen_parens[nt_idxs] += 1
-    self.ncons_nts[nt_idxs] += 1
-    self.nopen_parens[reduce_idxs] -= 1
-    self.ncons_nts[reduce_idxs] = 0
 
 class RNNGCell(nn.Module):
   """
@@ -699,18 +725,23 @@ class FixedStackRNNG(nn.Module):
   def build_beam_items(self, x, beam_size, shift_size):
     #stack_size = max(100, x.size(1) + 20)
     stack_size = min(int(x.size(1)*2.5), 104)
-    stack_size = math.ceil(stack_size / 8) * 8
-    #stack_size = max(10, stack_size)
+    stack_size = math.ceil(stack_size / 8) * 8  # force to be multiple of 8.
     initial_hidden = self.rnng.get_initial_hidden(x)
-    stack_for_unfinished = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
+    stack_unfinished, state_unfinished = self.new_stack_with_state(
+      initial_hidden, stack_size, beam_size)
     # The rationale behind (+shift_size*5) for beam size for finished BeamItems is
     # that # steps between words would probably be ~5 in most cases. Forcing to save shifts
     # after this many steps seems to be unnecessary.
-    stack_for_word_finished = FixedStack(initial_hidden, stack_size, self.input_size,
-                                         min(beam_size * 2, beam_size + shift_size*5))
+    stack_word_finished, state_word_finished = self.new_stack_with_state(
+      initial_hidden, stack_size, min(beam_size * 2, beam_size + shift_size*5))
     max_actions = max(100, x.size(1) * 5)
-    return (BeamItems(stack_for_unfinished, max_actions, False),
-            BeamItems(stack_for_word_finished, max_actions, True))
+    return (BeamItems(stack_unfinished, state_unfinished, max_actions, False),
+            BeamItems(stack_word_finished, state_word_finished, max_actions, True))
+
+  def new_stack_with_state(self, initial_hidden, stack_size, beam_size):
+    stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
+    stack_state = StackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
+    return stack, stack_state
 
   def variable_beam_search(self, x, K, original_reweight=False):
     self.eval()
