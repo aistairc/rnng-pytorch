@@ -2,6 +2,7 @@
 import numpy as np
 import itertools
 import random
+import torch
 import torch.nn.functional as F
 from nltk import Tree
 
@@ -200,6 +201,13 @@ def length_to_mask(length):
   max_len = length.max()
   r = length.new_ones(length.size(0), max_len).cumsum(dim=1)
   return length.unsqueeze(1) >= r
+
+def bincount_and_supply(x, max_size):
+  counts = x.bincount()
+  assert counts.size(0) <= max_size
+  if counts.size(0) < max_size:
+    counts = torch.cat([counts, counts.new_zeros(max_size - counts.size(0))])
+  return counts
 
 def masked_softmax(xs, mask, dim=-1):
   while mask.dim() < xs.dim():

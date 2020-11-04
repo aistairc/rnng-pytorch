@@ -1,3 +1,4 @@
+import math
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -126,6 +127,7 @@ class AttentionComposition(nn.Module):
 
 class FixedStack:
   def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
+    super(FixedStack, self).__init__()
     device = initial_hidden[1].device
     hidden_size = initial_hidden[0].size(-2)
     num_layers = initial_hidden[0].size(-1)
@@ -142,6 +144,7 @@ class FixedStack:
 
     self.batch_size = initial_hidden[0].size(0)
     self.beam_size = beam_size
+    self.stack_size = stack_size
 
     self.pointer = torch.zeros(batch_size, dtype=torch.long, device=device)  # word pointer
     self.top_position = torch.zeros(batch_size, dtype=torch.long, device=device)  # stack top position
@@ -153,7 +156,7 @@ class FixedStack:
       self.hiddens[:, 0] = initial_hidden[0].float()
       self.cells[:, 0] = initial_hidden[1].float()
     else:
-      # Only fill zero-th beam position because we do not other beam elems at beginning of search.
+      # Only fill zero-th beam position because we do not have other beam elems at beginning of search.
       self.hiddens[:, 0, 0] = initial_hidden[0].float()
       self.cells[:, 0, 0] = initial_hidden[1].float()
 
@@ -207,7 +210,7 @@ class FixedStack:
     max_ch_length = child_length.max()
 
     child_idx = prev_nt_position.unsqueeze(1) + torch.arange(max_ch_length, device=prev_nt_position.device)
-    child_idx[child_idx >= self.trees.size(1)] = self.trees.size(1) - 1  # ceiled at maximum stack size (exceeding this may occur for some batches, but those should be ignored safely.)
+    child_idx[child_idx >= self.stack_size] = self.stack_size - 1  # ceiled at maximum stack size (exceeding this may occur for some batches, but those should be ignored safely.)
     child_idx = child_idx.unsqueeze(-1).expand(-1, -1, self.trees.size(-1))  # (num_reduced_batch, max_num_child, input_dim)
     reduced_children = torch.gather(self.trees[reduce_batches], 1, child_idx)
     return reduced_children, child_length, reduced_nts, reduced_nt_ids
@@ -225,18 +228,215 @@ class FixedStack:
     self.nopen_parens = [0] * batch_size
     self.ncons_nts = [0] * batch_size
 
-  def update_nt_counts(self, actions, action_dict):
-    for i, a in enumerate(actions.cpu()):
-      a = a.item()
-      if action_dict.is_shift(a):
-        self.ncons_nts[i] = 0
-      elif action_dict.is_nt(a):
-        self.nopen_parens[i] += 1
-        self.ncons_nts[i] += 1
-      elif action_dict.is_reduce(a):
-        self.nopen_parens[i] -= 1
-        self.ncons_nts[i] = 0
+  def sort_by(self, sort_idx):
+    """
 
+    :param sort_idx: (batch_size, beam_size) or (batch_size)
+    """
+
+    def sort_tensor(tensor):
+      _idx = sort_idx
+      for i in range(sort_idx.dim(), tensor.dim()):
+        _idx = _idx.unsqueeze(-1)
+      return torch.gather(tensor, sort_idx.dim()-1, _idx.expand(tensor.size()))
+
+    self.pointer = sort_tensor(self.pointer)
+    self.top_position = sort_tensor(self.top_position)
+    self.hiddens = sort_tensor(self.hiddens)
+    self.cells = sort_tensor(self.cells)
+    self.trees = sort_tensor(self.trees)
+    self.nt_index = sort_tensor(self.nt_index)
+    self.nt_ids = sort_tensor(self.nt_ids)
+    self.nt_index_pos = sort_tensor(self.nt_index_pos)
+
+  def move_beams(self, self_move_idxs, other, move_idxs):
+    self.pointer[self_move_idxs] = other.pointer[move_idxs]
+    self.top_position[self_move_idxs] = other.top_position[move_idxs]
+    self.hiddens[self_move_idxs] = other.hiddens[move_idxs]
+    self.cells[self_move_idxs] = other.cells[move_idxs]
+    self.trees[self_move_idxs] = other.trees[move_idxs]
+    self.nt_index[self_move_idxs] = other.nt_index[move_idxs]
+    self.nt_ids[self_move_idxs] = other.nt_ids[move_idxs]
+    self.nt_index_pos[self_move_idxs] = other.nt_index_pos[move_idxs]
+
+
+class BeamItems:
+  def __init__(self, stack, max_actions = 500, beam_is_empty = False):
+    self.batch_size = stack.batch_size
+    self.beam_size = stack.beam_size
+    self.stack = stack
+
+    self.gen_ll = torch.tensor([-float('inf')], device=stack.hiddens.device).expand(
+      self.batch_size, self.beam_size).clone()
+    self.disc_ll = torch.tensor([-float('inf')], device=stack.hiddens.device).expand(
+      self.batch_size, self.beam_size).clone()
+    self.gen_ll[:, 0] = 0
+    self.disc_ll[:, 0] = 0
+
+    if beam_is_empty:
+        # how many beam elements are active for each batch?
+      self.beam_widths = self.gen_ll.new_zeros(self.batch_size, dtype=torch.long)
+    else:
+      self.beam_widths = self.gen_ll.new_ones(self.batch_size, dtype=torch.long)
+
+    self.ncons_nts = self.beam_widths.new_zeros((self.batch_size, self.beam_size))
+    self.nopen_parens = self.beam_widths.new_zeros((self.batch_size, self.beam_size))
+
+    self.actions = self.beam_widths.new_full((self.batch_size, self.beam_size, max_actions), -1)
+    self.actions_pos = self.beam_widths.new_zeros(self.batch_size, self.beam_size)
+
+  def prev_actions(self):
+    return self.actions.gather(2, self.actions_pos.unsqueeze(-1)).squeeze(-1)  # (batch_size, beam_size)
+
+  def nbest_parses(self):
+    widths = self.beam_widths.cpu().numpy()
+    actions = self.actions.cpu().numpy()
+    actions_pos = self.actions_pos.cpu().numpy()
+
+    def tree_actions(batch, beam):
+      return (actions[batch, beam, 1:actions_pos[batch, beam]+1], self.gen_ll[batch, beam].item())
+
+    def batch_actions(batch):
+      return [tree_actions(batch, i) for i in range(widths[batch])]
+
+    return [batch_actions(b) for b in range(len(widths))]
+
+  def shrink(self, size):
+    outside_beam_idx = (torch.arange(self.beam_size, device=self.gen_ll.device).unsqueeze(0) >=
+                        self.beam_widths.unsqueeze(1)).nonzero(as_tuple=True)
+    self.gen_ll[outside_beam_idx] = -float('inf')
+    self.gen_ll, sort_idx = torch.sort(self.gen_ll, descending=True)
+    self.disc_ll = torch.gather(self.disc_ll, 1, sort_idx)
+    self.stack.sort_by(sort_idx)
+    self.beam_widths = torch.min(self.beam_widths, self.beam_widths.new_tensor([size]))
+    self.ncons_nts = torch.gather(self.ncons_nts, 1, sort_idx)
+    self.nopen_parens = torch.gather(self.nopen_parens, 1, sort_idx)
+
+    self.actions = torch.gather(self.actions, 1, sort_idx.unsqueeze(-1).expand(self.actions.size()))
+    self.actions_pos = torch.gather(self.actions_pos, 1, sort_idx)
+
+  def active_idxs(self):
+    """
+    :return (batch_idxs, beam_idxs): All active idxs according to active beam sizes for each batch
+                                     defined by self.beam_widths.
+    """
+    return (self.active_idx_mask() == 1).nonzero(as_tuple=True)
+
+  def active_idx_mask(self):
+    order = torch.arange(self.beam_size, device=self.beam_widths.device)
+    return order < self.beam_widths.unsqueeze(1)
+
+  def clear(self):
+    self.beam_widths[:] = 0
+
+  def move_items_from(self, other, move_idxs, new_gen_ll = None, new_disc_ll = None):
+    """
+
+    :param other: BeamItems
+    :param move_idxs: A pair of index tensors (for batch_index and beam_index)
+    :param new_gen_ll: If not None, replace gen_ll of the target positions with this vector.
+    :param new_disc_ll: If not None, replace disc_ll of the target positions with this vector.
+    """
+    assert len(move_idxs) == 2  # hard-coded for beam search case.
+    # This method internally presupposes that batch_index is sorted.
+    assert torch.equal(move_idxs[0].sort()[0], move_idxs[0])
+    move_batch_idxs, move_beam_idxs = move_idxs
+
+    batch_numbers = bincount_and_supply(move_batch_idxs, self.batch_size)
+    max_moved_beam_size = batch_numbers.max()
+    new_beam_widths = self.beam_widths + batch_numbers  # (batch_size)
+    if (new_beam_widths.max() > self.beam_size):
+      # When exceeding max beam size.
+      # This may happen when moving shifted elements to the word-finished BeamItems, maybe
+      # especially when shift_size is larger.
+      # We don't save this case and discard elements not fitted in self.beam_size.
+      beam_idx_order = torch.arange(max_moved_beam_size, device=batch_numbers.device)
+      sum_beam_idx_order =  self.beam_widths.unsqueeze(1) + beam_idx_order
+      move_idx_mask = sum_beam_idx_order < self.beam_size
+      move_idx_mask = move_idx_mask.view(-1)[
+        (beam_idx_order < batch_numbers.unsqueeze(1)).view(-1)]
+      move_idxs = (move_idxs[0][move_idx_mask], move_idxs[1][move_idx_mask])
+      move_batch_idxs, move_beam_idxs = move_idxs
+      if new_gen_ll is not None:
+        new_gen_ll = new_gen_ll[move_idx_mask]
+      if new_disc_ll is not None:
+        new_disc_ll = new_disc_ll[move_idx_mask]
+      batch_numbers = bincount_and_supply(move_batch_idxs, self.batch_size)
+      max_moved_beam_size = batch_numbers.max()
+      new_beam_widths = self.beam_widths + batch_numbers  # (batch_size)
+
+    self_move_beam_idxs = self.beam_widths.unsqueeze(1) + torch.arange(
+      max_moved_beam_size, device=batch_numbers.device)
+    self_beam_idx_mask = self_move_beam_idxs < new_beam_widths.unsqueeze(1)
+    self_move_beam_idxs = self_move_beam_idxs.view(-1)[self_beam_idx_mask.view(-1).nonzero(as_tuple=True)]
+    assert self_move_beam_idxs.size() == move_beam_idxs.size()
+
+    self_move_idxs = (move_batch_idxs, self_move_beam_idxs)
+    self.beam_widths = new_beam_widths
+    self.gen_ll[self_move_idxs] = new_gen_ll if new_gen_ll is not None else other.gen_ll[move_idxs]
+    self.disc_ll[self_move_idxs] = new_disc_ll if new_disc_ll is not None else other.disc_ll[move_idxs]
+    self._do_move_elements(other, self_move_idxs, move_idxs, new_gen_ll, new_disc_ll)
+
+    return self_move_idxs
+
+  def reconstruct(self, target_idxs):
+    """
+
+    Intuitively perform beam[:] = beam[target_idxs]. target_idxs contains duplicates so this would
+    copy some elements across different idxs. A core function in beam search.
+    """
+    assert self.beam_widths.sum() > 0
+
+    assert len(target_idxs) == 2  # hard-coded for beam search case.
+    move_batch_idxs, move_beam_idxs = target_idxs
+    self.beam_widths = bincount_and_supply(move_batch_idxs, self.batch_size)
+    assert self.beam_widths.max() <= self.beam_size
+
+    self_move_beam_idxs = (torch.arange(self.beam_widths.max(), device=target_idxs[0].device)
+                           .unsqueeze(0).repeat(self.beam_widths.size(0), 1))
+    self_beam_idx_mask = self_move_beam_idxs < self.beam_widths.unsqueeze(1)
+    self_move_beam_idxs = self_move_beam_idxs.view(-1)[
+      self_beam_idx_mask.view(-1).nonzero(as_tuple=True)]
+    assert self_move_beam_idxs.size() == move_beam_idxs.size()
+
+    self_move_idxs = (move_batch_idxs, self_move_beam_idxs)
+    self._do_move_elements(self, self_move_idxs, target_idxs)
+
+    return self_move_idxs
+
+  def marginal_probs(self):
+    active_idx_mask = self.active_idx_mask()
+    self.gen_ll[active_idx_mask != 1] = -float('inf')
+    return torch.logsumexp(self.gen_ll, 1)
+
+  def _do_move_elements(self, source, self_idxs, source_idxs, new_gen_ll = None, new_disc_ll = None):
+    self.gen_ll[self_idxs] = new_gen_ll if new_gen_ll is not None else source.gen_ll[source_idxs]
+    self.disc_ll[self_idxs] = new_disc_ll if new_disc_ll is not None else source.disc_ll[source_idxs]
+
+    self.ncons_nts[self_idxs] = source.ncons_nts[source_idxs]
+    self.nopen_parens[self_idxs] = source.nopen_parens[source_idxs]
+    self.stack.move_beams(self_idxs, source.stack, source_idxs)
+
+    self.actions[self_idxs] = source.actions[source_idxs]
+    self.actions_pos[self_idxs] = source.actions_pos[source_idxs]
+
+  def do_action(self, actions, action_dict):
+    active_idxs = self.active_idxs()
+    self.actions_pos[active_idxs] += 1
+    self.actions[active_idxs + (self.actions_pos[active_idxs],)] = actions[active_idxs]
+
+    self._update_nt_counts(actions, action_dict)
+
+  def _update_nt_counts(self, actions, action_dict):
+    shift_idxs = (actions == action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
+    nt_idxs = (actions >= action_dict.nt_begin_id()).nonzero(as_tuple=True)
+    reduce_idxs = (actions == action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
+
+    self.ncons_nts[shift_idxs] = 0
+    self.nopen_parens[nt_idxs] += 1
+    self.ncons_nts[nt_idxs] += 1
+    self.nopen_parens[reduce_idxs] -= 1
+    self.ncons_nts[reduce_idxs] = 0
 
 class RNNGCell(nn.Module):
   """
@@ -317,6 +517,7 @@ class RNNGCell(nn.Module):
 
     return stack.hidden_head()[..., -1]
 
+
 class FixedStackRNNG(nn.Module):
   def __init__(self, action_dict,
                vocab = 100,
@@ -376,9 +577,8 @@ class FixedStackRNNG(nn.Module):
     hs = self.rnng.output(hs.transpose(1, 0).contiguous())  # (batch_size, action_len, input_size)
     return hs
 
-  def build_stack(self, x, batch_size = None):
+  def build_stack(self, x):
     stack_size = max(150, x.size(1) + 100)
-    batch_size = batch_size or x.size(0)
     initial_hidden = self.rnng.get_initial_hidden(x)
     return FixedStack(initial_hidden, stack_size, self.input_size)
 
@@ -423,61 +623,102 @@ class FixedStackRNNG(nn.Module):
     if word_beam_size <= 0:
       word_beam_size = beam_size
 
-    beam = self.initial_beam(x)
-    word_completed = [[] for _ in range(x.size(0))]
+    beam, word_completed_beam = self.build_beam_items(x, beam_size, shift_size)
     word_vecs = self.emb(x)
     word_marginal_ll = [[] for _ in range(x.size(0))]
 
-    if return_beam_history:
-      beam_histroy = []
-
     for pointer in range(x.size(1) + 1):
-      forced_completions = [0 for _ in range(x.size(0))]
+      forced_completions = x.new_zeros(x.size(0), dtype=torch.long)
       bucket_i = 0
-      while not all(len(batch_beam) == 0 for batch_beam in beam):
-        new_beam, added_forced_completions = self.get_successors(
-          x, pointer, beam, beam_size, shift_size)
-        for i, c in enumerate(added_forced_completions):
-          forced_completions[i] += c
 
-        all_items, batch_idx = self._flatten_items(new_beam)
+      def word_finished_batches():
+        return ((beam.beam_widths == 0) +  # Empty beam means no action remains (finished).
+                #(word_completed_beam.beam_widths >= (word_completed_beam.beam_size - 1)) +
+                (word_completed_beam.beam_widths >= word_completed_beam.beam_size) +
+                ((word_completed_beam.beam_widths - forced_completions) >= beam_size))
 
-        self.update_stack_rnn_beam(all_items, word_vecs, batch_idx, pointer)
+      finished_batches = word_finished_batches()
 
-        beam_lengths = [len(batch_beam) for batch_beam in new_beam]
-        self.update_beam_and_word_completed(
-          beam, word_completed, all_items, beam_lengths, pointer == x.size(1))
-
-        for b in range(len(beam)):
-          if len(word_completed[b]) - forced_completions[b] >= beam_size:
-            beam[b] = []
-        if return_beam_history:
-          beam_histroy.append((pointer,
-                               bucket_i,
-                               [b[:] for b in beam],
-                               [b[:] for b in word_completed]))
+      while not finished_batches.all():
+        added_forced_completions = self.beam_step(
+          x, word_vecs, pointer, beam, word_completed_beam, shift_size)
+        forced_completions += added_forced_completions
+        finished_batches = word_finished_batches()
+        beam.beam_widths[finished_batches.nonzero(as_tuple=True)] = 0  # inactive word-finished batches.
         bucket_i += 1
 
-      for b in range(len(beam)):
-        word_completed[b].sort(key=lambda x: x.score, reverse=True)
-        beam[b] = word_completed[b][:word_beam_size]
-        word_completed[b] = []
+      self.finalize_word_completed_beam(
+        x, word_vecs, pointer, beam, word_completed_beam, word_beam_size)
 
-      marginal = self._get_marginal_ll(beam)
-      for b, s in enumerate(marginal):
+      marginal = beam.marginal_probs()
+      for b, s in enumerate(marginal.cpu().detach().numpy()):
         word_marginal_ll[b].append(s)
 
-    parses = [[(item.parse_actions(), item.score) for item in  batch_beam]
-              for batch_beam in beam]
-    surprisals = [[] for _ in range(len(beam))]
-    for b in range(len(beam)):
+    parses = beam.nbest_parses()
+    surprisals = [[] for _ in range(x.size(0))]
+    for b in range(x.size(0)):
       for i in range(0, len(word_marginal_ll[b])-1):
         surprisals[b].append(-word_marginal_ll[b][i] - (-word_marginal_ll[b][i-1] if i > 0 else 0))
 
     ret = (parses, surprisals)
-    if return_beam_history:
-      ret += (beam_histroy,)
     return ret
+
+  def beam_step(self, x, word_vecs, pointer, beam, word_completed_beam, shift_size):
+    beam_size = beam.beam_size
+    successors, word_completed_successors, added_forced_completions \
+      = self.get_successors(x, pointer, beam, beam_size, shift_size)
+
+    # tuple of ((batch_idxs, beam_idxs), next_actions, total_scores)
+    assert len(successors) == len(word_completed_successors) == 3
+
+    if word_completed_successors[0][0].size(0) > 0:
+      comp_idxs = tuple(word_completed_successors[0][:2])
+      # Add elements to word_completed_beam
+      # This assumes that returned scores are total scores rather than the current action scores.
+      moved_idxs = word_completed_beam.move_items_from(
+        beam, comp_idxs, new_gen_ll=word_completed_successors[2])
+
+    new_beam_idxs = beam.reconstruct(successors[0][:2])
+    beam.gen_ll[new_beam_idxs] = successors[2]
+    actions = successors[1].new_full((x.size(0), beam_size), self.action_dict.padding_idx)
+    actions[new_beam_idxs] = successors[1]
+    self.rnng(word_vecs, actions, beam.stack)
+    beam.do_action(actions, self.action_dict)
+
+    return added_forced_completions
+
+  def finalize_word_completed_beam(
+      self, x, word_vecs, pointer, beam, word_completed_beam, word_beam_size):
+    beam_size = word_completed_beam.beam_size
+    word_completed_beam.shrink(word_beam_size)
+    word_end_actions = x.new_full((x.size(0), beam_size), self.action_dict.padding_idx)
+    active_idx = word_completed_beam.active_idxs()
+    if pointer < x.size(1):  # do shift
+      word_end_actions[active_idx] = self.action_dict.a2i['SHIFT']
+    else:
+      word_end_actions[active_idx] = self.action_dict.finish_action()
+    self.rnng(word_vecs, word_end_actions, word_completed_beam.stack)
+    word_completed_beam.do_action(word_end_actions, self.action_dict)
+
+    beam.clear()
+    beam.move_items_from(word_completed_beam, active_idx)
+    word_completed_beam.clear()
+
+  def build_beam_items(self, x, beam_size, shift_size):
+    #stack_size = max(100, x.size(1) + 20)
+    stack_size = min(int(x.size(1)*2.5), 104)
+    stack_size = math.ceil(stack_size / 8) * 8
+    #stack_size = max(10, stack_size)
+    initial_hidden = self.rnng.get_initial_hidden(x)
+    stack_for_unfinished = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
+    # The rationale behind (+shift_size*5) for beam size for finished BeamItems is
+    # that # steps between words would probably be ~5 in most cases. Forcing to save shifts
+    # after this many steps seems to be unnecessary.
+    stack_for_word_finished = FixedStack(initial_hidden, stack_size, self.input_size,
+                                         min(beam_size * 2, beam_size + shift_size*5))
+    max_actions = max(100, x.size(1) * 5)
+    return (BeamItems(stack_for_unfinished, max_actions, False),
+            BeamItems(stack_for_word_finished, max_actions, True))
 
   def variable_beam_search(self, x, K, original_reweight=False):
     self.eval()
@@ -536,28 +777,19 @@ class FixedStackRNNG(nn.Module):
     return [[ParticleBeamItem.from_initial_state(state, K)] for state in states]
 
   def get_successors(self, x, pointer, beam, beam_size, shift_size):
-    all_items, _ = self._flatten_items(beam)
-    beam_lengths = [len(batch_beam) for batch_beam in beam]
-    states = [item.state for item in all_items]
-
     if pointer < x.size(1):
-      next_x = [x[b, pointer].expand(beam_lengths[b]) for b in range(x.size(0))]
-      next_x = torch.cat(next_x)  # (total beam size)
+      next_x = x[:, pointer]
     else:
       next_x = None
 
-    action_mask = self.valid_action_mask(all_items, x.size(1))  # (total beam size, n_actions)
+    invalid_action_mask = self.invalid_action_mask(beam, x.size(1))  # (total beam size, n_actions)
 
-    log_probs = self.action_log_probs(states, action_mask, next_x)  # tensor of size (total beam, n_actions)
-    log_probs += log_probs.new_tensor([item.score for item in all_items]).unsqueeze(1)
-    log_probs = self._deflatten_items(log_probs, beam_lengths)
-    successors, forced_completions = self.scores_to_successors(
-      x, pointer, beam, log_probs, beam_size, shift_size)
+    log_probs = self.action_log_probs(beam.stack, invalid_action_mask, next_x)  # (batch, beam, n_actions)
+    # scores for inactive beam items (outside active_idx) are -inf on log_probs so we need
+    # not worry about values in gen_ll outside active_idx.
+    log_probs += beam.gen_ll.unsqueeze(-1)
 
-    successors = [[beam[batch_i][b].next_incomplete_item(a, s) for (b, a, s) in batch_succs]
-                  for batch_i, batch_succs in enumerate(successors)]
-
-    return successors, forced_completions
+    return self.scores_to_successors(x, pointer, beam, log_probs, beam_size, shift_size)
 
   def get_successors_by_particle_filter(self, x, pointer, beam):
     all_items, _ = self._flatten_items(beam)
@@ -629,260 +861,150 @@ class FixedStackRNNG(nn.Module):
 
     return new_beam
 
-  def action_log_probs(self, states, action_mask, next_x = None, return_disc_probs = False):
+  def action_log_probs(self, stack, invalid_action_mask, next_x = None, return_disc_probs = False):
     """
-    states: tensor of size (batch, hidden_size)
-    new_x: tensor of size (batch)
+
+    :param stack: FixedStack
+    :param invalid_action_mask: (batch_size, beam_size, num_actions)  (inactive beams are entirely masked.)
+    :param next_x: (batch_size) to be shifted token ids
     """
-    hiddens = self.stack_top_h(states)  # (total beam size, hidden_size)
-    hiddens = self.rnng.output(hiddens)  # (total beam size, hidden_size)
+    hiddens = self.rnng.output(stack.hidden_head()[:, :, -1])  # (beam*batch, hidden_size)
+    action_logit = self.action_mlp(hiddens).view(invalid_action_mask.size())  # (beam, batch, num_actions)
+    action_logit[invalid_action_mask] = -float('inf')
 
-    action_logit = self.action_mlp(hiddens)
-    action_logit[action_mask != 1] = -float('inf')
-
-    log_probs = F.log_softmax(action_logit, -1)  # (total beam size, num_actions)
+    log_probs = F.log_softmax(action_logit, -1)  # (batch_size, beam_size, num_actions)
+    log_probs[torch.isnan(log_probs)] = -float('inf')
     if return_disc_probs:
       disc_log_probs = log_probs.clone()
 
     if next_x is not None:  # shift is valid for next action
-      word_logit = self.vocab_mlp(hiddens)
+      word_logit = self.vocab_mlp(hiddens)  # (batch*beam, vocab_size)
       shift_idx = self.action_dict.a2i['SHIFT']
-      assert next_x.size(0) == hiddens.size(0)
-      word_log_probs = self.word_criterion(word_logit, next_x) * -1.0  # (total beam size)
-      log_probs[:, shift_idx] += word_log_probs
+      next_x = next_x.unsqueeze(1).expand(-1, log_probs.size(1)).clone().view(-1)  # (batch*beam)
+      word_log_probs = self.word_criterion(word_logit, next_x) * -1.0  # (batch_size*beam_size, vocab_size)
+      word_log_probs = word_log_probs.view(log_probs.size(0), log_probs.size(1))
+      log_probs[:, :, shift_idx] += word_log_probs
 
     if return_disc_probs:
       return (log_probs, disc_log_probs)
     else:
       return log_probs
 
-  def valid_action_mask(self, items, sent_len):
-    mask = torch.ones((len(items), self.num_actions), dtype=torch.uint8)
-    mask[:, self.action_dict.padding_idx] = 0
-    for b, item in enumerate(items):
-      state = item.state
-      prev_action = item.action
-      if state.pointer == sent_len and state.nopen_parens == 0:  # finished
-        mask[b, :] = 0
-        continue
-      if state.nopen_parens == 0:  # only nt
-        assert state.pointer == 0 and len(state.hiddens) == 1
-        self.action_dict.mask_shift(mask, b)
-        self.action_dict.mask_reduce(mask, b)
-      if state.pointer == sent_len:  # only reduce
-        self.action_dict.mask_nt(mask, b)
-        self.action_dict.mask_shift(mask, b)
-      if (state.nopen_parens > self.max_open_nts or
-          state.ncons_nts >= self.max_cons_nts):  # no more open
-        self.action_dict.mask_nt(mask, b)
+  def invalid_action_mask(self, beam, sent_len):
+    """Return a tensor where mask[i,j,k]=True means action k is not allowed for beam (i,j).
+    """
+    action_order = torch.arange(self.num_actions, device=beam.nopen_parens.device)
 
-      if ((state.nopen_parens == 1 and state.pointer < sent_len) or # cannot reduce the unique open element at intermediate steps.
-          self.action_dict.is_nt(prev_action) or # cannot reduce immediately after nt
-          len(state.hiddens) < 3):
-        self.action_dict.mask_reduce(mask, b)
-    mask = mask.to(items[0].state.hiddens[0].device)
+    # reduce_mask[i,j,k]=True means k is a not allowed reduce action for (i,j).
+    reduce_mask = (action_order == self.action_dict.a2i['REDUCE']).view(1, 1, -1)
+    reduce_mask = ((((beam.nopen_parens == 1) * (beam.stack.pointer < sent_len)) +
+                    # prev is nt => cannot reduce immediately after nt
+                    (beam.prev_actions() >= self.action_dict.nt_begin_id()) +
+                    (beam.stack.top_position < 2)).unsqueeze(-1) *
+                   reduce_mask)
 
-    return mask
+    # nt_mask[i,j,k]=True means k is a not allowed nt action for (i,j).
+    nt_mask = (action_order >= self.action_dict.nt_begin_id()).view(1, 1, -1)
+    nt_mask = (((beam.nopen_parens >= self.max_open_nts) +
+                (beam.ncons_nts >= self.max_cons_nts) +
+                # Check the storage of beam.actions, which is bounded beforehand.
+                (beam.actions.size(2) - beam.actions_pos < (
+                  sent_len - beam.stack.pointer + beam.nopen_parens + 1)) +
+                # Check the storage of fixed stack size (we need minimally two additional
+                # elements to process arbitrary future structure).
+                (beam.stack.top_position >= beam.stack.stack_size-2)).unsqueeze(-1) *
+               nt_mask)
+
+    shift_mask = (action_order == self.action_dict.a2i['SHIFT']).view(1, 1, -1)
+    shift_mask = (beam.stack.top_position >= beam.stack.stack_size-1).unsqueeze(-1) * shift_mask
+
+    # all actions other than nt are invalid;
+    # except_nt_mask[i,j,k]=True means k (not nt) is not allowed for (i,j).
+    except_nt_mask = (action_order < self.action_dict.nt_begin_id()).view(1, 1, -1)
+    except_nt_mask = (beam.nopen_parens == 0).unsqueeze(-1) * except_nt_mask
+
+    except_reduce_mask = (action_order != self.action_dict.a2i['REDUCE']).view(1, 1, -1)
+    except_reduce_mask = (beam.stack.pointer == sent_len).unsqueeze(-1) * except_reduce_mask
+
+    pad_mask = (action_order == self.action_dict.padding_idx).view(1, 1, -1)
+    finished_mask = ((beam.stack.pointer == sent_len) * (beam.nopen_parens == 0)).unsqueeze(-1)
+    beam_width_mask = (torch.arange(beam.beam_size, device=reduce_mask.device).unsqueeze(0) >=
+                       beam.beam_widths.unsqueeze(1)).unsqueeze(-1)
+
+    return (reduce_mask + nt_mask + shift_mask + except_nt_mask + except_reduce_mask +
+            pad_mask + finished_mask + beam_width_mask)
 
   def stack_top_h(self, states):
     return torch.stack([state.hiddens[-1][:, -1] for state in states], dim=0)
 
   def scores_to_successors(self, x, pointer, beam, total_scores, beam_size, shift_size):
-    successors = [[] for _ in range(len(total_scores))]
-    forced_completions = [0 for _ in range(len(total_scores))]
-    for batch, batch_total_scores in enumerate(total_scores):
-      if batch_total_scores.size(0) == 0:
-        continue  # this batch is finished.
-      _, num_actions = batch_total_scores.size()
+    assert (total_scores.isnan() != 1).all()
+    num_actions = total_scores.size(2)
+    total_scores = total_scores.view(total_scores.size(0), -1)
+    sorted_scores, sort_idx = torch.sort(total_scores, descending=True)
 
-      scores = batch_total_scores.view(-1)
-      sorted_scores, sort_idx = torch.sort(scores, descending=True)
+    beam_id = sort_idx // num_actions
+    action_id = sort_idx % num_actions
 
-      active_span = (sorted_scores != -float('inf')).nonzero()[-1][0] + 1
-      sorted_scores = sorted_scores[:active_span]
-      sort_idx = sort_idx[:active_span]
+    valid_action_mask = sorted_scores != -float('inf')
 
-      beam_id = sort_idx // num_actions
-      action_id = sort_idx % num_actions
-
-      beam_id_np = beam_id.cpu().numpy()
-      action_id_np = action_id.cpu().numpy()
-      sorted_scores_np = sorted_scores.cpu().numpy()
-
-      successors[batch] = [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
-                           for i in range(min(len(beam_id_np), beam_size))]
-      if pointer < x.size(1):
-        # shift is target for being forced.
-        shift_in_successors = (action_id[:beam_size] == self.action_dict.a2i['SHIFT']).nonzero().size(0)
-        if shift_in_successors < shift_size:
-          # find and add additional forced shift successors
-          additional = ((action_id[beam_size:] == self.action_dict.a2i['SHIFT'])
-                        .nonzero()[:shift_size - shift_in_successors].squeeze(1)).cpu()
-          additional += beam_size  # add offset
-          assert all(action_id_np[i] == self.action_dict.a2i['SHIFT'] for i in additional)
-          successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
-                                for i in additional]
-          forced_completions[batch] = additional.size(0)
-      else:
-        # At the end, save final actions.
-        finish_actions = [(b, a, s) for (b, a, s) in successors[batch]
-                          if self._is_last_action(a, beam[batch][b].state, True)]
-
-        if len(finish_actions) < shift_size:
-          remain = shift_size - len(finish_actions)
-          additional = []
-          for i in range(beam_size, len(beam_id_np)):
-            b = beam_id_np[i]
-            a = action_id_np[i]
-            if self._is_last_action(a, beam[batch][b].state, True):
-              additional.append(i)
-            if len(additional) >= remain:
-              break
-          successors[batch] += [(beam_id_np[i], action_id_np[i], sorted_scores_np[i])
-                                for i in additional]
-          forced_completions[batch] = len(additional)
-
-    return successors, forced_completions
-
-  def update_stack_rnn_beam(self, items, word_vecs, batch_idx, pointer):
-    """
-    This method does some preparation for update_stack_rnn.
-
-    items is a flattened tensor. batch_idx is mapping from index in flattend
-    list to the original batch, which is necessary to get correct mapping from
-    word_vecs, which is not flattened and has size of (batch_size, num words).
-    """
-    states = [item.state for item in items]
-    actions = word_vecs.new_tensor([item.action for item in items], dtype=torch.long)
-
-    batch_idx_tensor = word_vecs.new_tensor(batch_idx, dtype=torch.long)
-    shifts = (actions == self.action_dict.a2i['SHIFT']).nonzero().squeeze(1)
-
-    shifted_batch_idx = batch_idx_tensor[shifts]
-    if pointer < word_vecs.size(1):
-      shifted_words = word_vecs[shifted_batch_idx, pointer]
+    if pointer < x.size(1):  #
+      end_action_mask = action_id == self.action_dict.a2i['SHIFT']
     else:
-      # At end of sentence. Since shift is not allowed, shifted_words will become
-      # empty. We have to process this condition separately.
-      assert shifted_batch_idx.size(0) == 0
-      shifted_words = word_vecs[shifted_batch_idx, -1]
+      # top_down specific masking; should be separated in a function and adjusted for in_order.
+      pre_final_mask = beam.nopen_parens.gather(1, beam_id) == 1
+      end_action_mask = action_id == self.action_dict.finish_action()
+      end_action_mask = end_action_mask * pre_final_mask
 
-    self.update_stack_rnn(states, actions, shifts, shifted_words)
+    end_action_mask = valid_action_mask * end_action_mask
+    no_end_action_mask = valid_action_mask * (end_action_mask != 1)
 
-  def update_stack_rnn(self, states, actions, shift_idx, shifted_embs):
-    assert actions.size(0) == len(states)
-    assert shift_idx.size(0) == shifted_embs.size(0)
-    if len(states) == 0:
-      return
+    within_beam_end_action_idx = end_action_mask[:, :beam_size].nonzero(as_tuple=True)
+    within_beam_num_end_actions = bincount_and_supply(
+      within_beam_end_action_idx[0], x.size(0))  # (batch_size)
+    # max num of forcefully shifted actions (actual number is upperbounded by active actions).
+    num_to_be_forced_completions = torch.maximum(
+      torch.tensor([0], device=x.device).expand(x.size(0)),
+      shift_size - within_beam_num_end_actions)  # (batch_size)
 
-    reduces = (actions == self.action_dict.a2i['REDUCE']).nonzero().squeeze(1)
-    nts = (actions >= self.action_dict.nt_begin_id()).nonzero().squeeze(1)
+    outside_end_action_mask = end_action_mask[:, beam_size:]
+    outside_end_action_idx = outside_end_action_mask.nonzero(as_tuple=True)
+    # outside_end_action_idx[0] may be [0, 0, 0, 1, 2, 2]
+    # num_forced_completions might be [0, 1, 0];
+    # pick up only 4th element, i.e., make a mask [F, F, F, T, F, F]
+    #
+    # strategy:
+    #  outside_num_end_actions: [3, 1, 2]
+    #  order: [[0, 1, 2], [0, 1, 2], [0, 1, 2]]
+    #  size_recover_mask: [[T, T, T], [T, F, F], [T, T, F]]
+    #  forced_completion_mask: [[F, F, F], [T, F, F], [F, F, F]]
+    #  filter_mask: [F, F, F, T, F, F]
+    outside_num_end_actions = bincount_and_supply(outside_end_action_idx[0], x.size(0))
+    order = torch.arange(outside_num_end_actions.max(), device=x.device)
+    size_recover_mask = order < outside_num_end_actions.unsqueeze(1)
+    forced_completion_mask = order < num_to_be_forced_completions.unsqueeze(1)
+    filter_mask = forced_completion_mask.view(-1)[size_recover_mask.view(-1)]
+    outside_end_action_idx = (outside_end_action_idx[0][filter_mask],
+                              outside_end_action_idx[1][filter_mask])
 
-    new_stack_input = shifted_embs.new_zeros(actions.size(0), self.input_size)
+    outside_end_action_mask[:] = 0
+    outside_end_action_mask[outside_end_action_idx] = 1
 
-    if reduces.size(0) > 0:
-      reduce_idx = reduces.cpu().numpy()
-      reduce_states = [states[i] for i in reduce_idx]
-      children, ch_lengths, nt, nt_id = self._collect_children_for_reduce(reduce_states)
-      if isinstance(self.rnng.composition, AttentionComposition):
-        reduce_context = self.stack_top_h(reduce_states)
-        reduce_context = self.rnng.output(reduce_context)
-      else:
-        reduce_context = None
-      new_child, _, _ = self.rnng.composition(children, ch_lengths, nt, nt_id, reduce_context)
-      new_stack_input[reduces] = new_child.float()
+    num_forced_completions = bincount_and_supply(outside_end_action_idx[0], x.size(0))
 
-    new_stack_input[shift_idx] = shifted_embs
+    end_successor_idx = torch.cat(
+      [end_action_mask[:, :beam_size], outside_end_action_mask], dim=1).nonzero(as_tuple=True)
+    no_end_successor_idx = no_end_action_mask[:, :beam_size].nonzero(as_tuple=True)
 
-    nt_ids = (actions[nts] - self.action_dict.nt_begin_id())
-    nt_embs = self.rnng.nt_emb(nt_ids)
-    new_stack_input[nts] = nt_embs
+    def successor_idx_to_successors(successor_idx):
+      next_beam_ids = beam_id[successor_idx]
+      next_action_ids = action_id[successor_idx]
+      next_scores = sorted_scores[successor_idx]
+      return (successor_idx[0], next_beam_ids), next_action_ids, next_scores
 
-    stack_top_context = self._collect_stack_top_context(states)
-    new_stack_top = self.rnng.stack_rnn(new_stack_input, stack_top_context)
-
-    hiddens, cells = new_stack_top
-    for b in range(len(states)):
-      a = actions[b].item()
-      states[b].update_stack((hiddens[b], cells[b]), new_stack_input[b], a, self.action_dict)
-      states[b].do_action(a, self.action_dict)
-
-    #return self.rnng.output(new_stack_top[:, :, -1])
-
-  def update_beam_and_word_completed(self, beam, word_completed, items, beam_lengths, last_token=False):
-    accum = 0
-    for b in range(len(beam)):
-      beam[b] = []
-      l = beam_lengths[b]
-      for item in items[accum:accum+l]:
-        if (item.state.finished() or self.action_dict.is_shift(item.action)):
-          # Cases where shifting last+1 token should be pruned by action masking.
-          word_completed[b].append(item)
-        else:
-          beam[b].append(item)
-      accum += l
-    assert accum == sum(beam_lengths)
-
-  def _is_last_action(self, action, state, shifted_all):
-    return (shifted_all and self.action_dict.is_reduce(action) and
-            state.can_finish_by_reduce())
-
-  def _flatten_items(self, items):
-    flatten_items = []
-    idxs = []
-    for i, batch_items in enumerate(items):
-      flatten_items += batch_items
-      idxs += [i] * len(batch_items)
-    return flatten_items, idxs
-
-  def _deflatten_items(self, items, beam_lengths):
-    de_items = []
-    accum_idx = 0
-    for b, b_len in enumerate(beam_lengths):
-      de_items.append(items[accum_idx:accum_idx+b_len])
-      accum_idx += b_len
-    assert accum_idx == len(items)
-    return de_items  # List[Tensor]
-
-  def _collect_children_for_reduce(self, reduce_states):
-    children = []
-    nt = []
-    nt_ids = []
-    ch_lengths = []
-    for state in reduce_states:
-      reduced_nt, reduced_trees, nt_id = state.reduce_stack()
-      nt.append(reduced_nt)
-      nt_ids.append(nt_id)
-      children.append(reduced_trees)
-      ch_lengths.append(len(reduced_trees))
-
-    max_ch_len = max(ch_lengths)
-    zero_child = children[0][0].new_zeros(children[0][0].size())
-    for b, b_child in enumerate(children):
-      if len(b_child) < max_ch_len:
-        children[b] += [zero_child] * (max_ch_len - len(b_child))
-      children[b] = torch.stack(children[b], 0)
-
-    children = torch.stack(children, 0)
-    nt = torch.stack(nt, 0)
-    nt_ids = nt.new_tensor(nt_ids, dtype=torch.long)
-    ch_lengths = nt_ids.new_tensor(ch_lengths)
-
-    return (children, ch_lengths, nt, nt_ids)
-
-  def _collect_stack_top_context(self, states, idx = None, offset = 1):
-    if idx is None:
-      idx = range(len(states))
-    hs = torch.stack([states[i].hiddens[-offset] for i in idx])
-    cs = torch.stack([states[i].cells[-offset] for i in idx])
-    return hs, cs
-
-  def _get_marginal_ll(self, beam):
-    ll = []
-    for b in range(len(beam)):
-      scores = [item.score for item in beam[b]]
-      ll.append(torch.logsumexp(torch.tensor(scores), 0).item())
-    return ll
+    return (successor_idx_to_successors(no_end_successor_idx),
+            successor_idx_to_successors(end_successor_idx),
+            num_forced_completions)
 
 
 class TopDownState:
