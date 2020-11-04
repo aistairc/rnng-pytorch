@@ -220,14 +220,6 @@ class FixedStack:
     self.hiddens[self.batch_index + (pos,)] = new_hidden.float()
     self.cells[self.batch_index + (pos,)] = new_cell.float()
 
-  def reset_stack(self):
-    # may be useful for reusing stack.
-    self.pointer[:] = 0
-    self.nt_index_pos[:] = -1
-
-    self.nopen_parens = [0] * batch_size
-    self.ncons_nts = [0] * batch_size
-
   def sort_by(self, sort_idx):
     """
 
