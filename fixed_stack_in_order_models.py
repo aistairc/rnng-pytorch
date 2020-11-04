@@ -11,14 +11,14 @@ class FixedInOrderStack(FixedStack):
     super(FixedInOrderStack, self).__init__(initial_hidden, stack_size, input_size)
 
   def do_nt(self, nt_batches, nt_embs, nt_ids):
-    left_corner = self.trees[nt_batches, self.top_position[nt_batches]-1, :]
-    self.trees[nt_batches, self.top_position[nt_batches]-1, :] = nt_embs
-    self.trees[nt_batches, self.top_position[nt_batches], :] = left_corner
+    left_corner = self.trees[nt_batches + (self.top_position[nt_batches]-1,)]
+    self.trees[nt_batches + (self.top_position[nt_batches]-1,)] = nt_embs
+    self.trees[nt_batches + (self.top_position[nt_batches],)] = left_corner
 
     self.nt_index_pos[nt_batches] = self.nt_index_pos[nt_batches] + 1
-    self.nt_ids[nt_batches, self.nt_index_pos[nt_batches]] = nt_ids
+    self.nt_ids[nt_batches + (self.nt_index_pos[nt_batches],)] = nt_ids
     self.top_position[nt_batches] = self.top_position[nt_batches] + 1
-    self.nt_index[nt_batches, self.nt_index_pos[nt_batches]] = self.top_position[nt_batches] - 1
+    self.nt_index[nt_batches + (self.nt_index_pos[nt_batches],)] = self.top_position[nt_batches] - 1
 
 class FixedStackInOrderRNNG(FixedStackRNNG):
   def __init__(self, action_dict,
