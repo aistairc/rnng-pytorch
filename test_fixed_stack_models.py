@@ -3,6 +3,7 @@ from numpy.testing import assert_array_equal, assert_almost_equal, assert_allclo
 import torch
 
 from fixed_stack_models import *
+from fixed_stack_in_order_models import *
 from action_dict import TopDownActionDict, InOrderActionDict
 
 class TestFixedStackModels(unittest.TestCase):
@@ -463,10 +464,102 @@ class TestFixedStackModels(unittest.TestCase):
         self.assertEqual([len(s) for s in surprisals], [3, 3])
         self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
+    def test_in_order_invalid_action_mask(self):
+        model = self._get_simple_in_order_model(num_nts=2)
+        model.max_open_nts = 2
+        model.max_cons_nts = 2
+        x = torch.tensor([[2, 3], [1, 2]])
+        word_vecs = model.emb(x)
+        beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
+        sent_len = x.size(1)
+
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only shift is allowed.
+            [[[1, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1]],  # beam idx 1 does not exist.
+             [[1, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1]]]))
+
+        reconstruct_idx = (torch.tensor([0, 0, 1, 1]), torch.tensor([0, 0, 0, 0]))
+        beam.reconstruct(reconstruct_idx)
+
+        def do_action(actions):
+            model.rnng(word_vecs, actions, beam.stack)
+            beam.do_action(actions, model.action_dict)
+
+        do_action(torch.tensor([[1, 1], [1, 1]]))  # (shift, shift); (shift, shift)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 1, 1, 0, 0],
+              [1, 1, 1, 1, 0, 0]],
+             [[1, 1, 1, 1, 0, 0],
+              [1, 1, 1, 1, 0, 0]]]))
+
+        do_action(torch.tensor([[4, 4], [4, 4]]))  # (S, S); (S, S)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 0, 0, 1, 1, 1],
+              [1, 0, 0, 1, 1, 1]],
+             [[1, 0, 0, 1, 1, 1],
+              [1, 0, 0, 1, 1, 1]]]))
+
+        do_action(torch.tensor([[2, 1], [2, 1]]))  # (r, shift); (r, shift)  # reset ncons_nt
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 1, 1, 0, 0],  # (S w)
+              [1, 1, 0, 1, 0, 0]],  # (S w w
+             [[1, 1, 1, 1, 0, 0],  # (S w)
+              [1, 1, 0, 1, 0, 0]]]))  # (S w w
+
+        do_action(torch.tensor([[4, 2], [4, 4]]))  # (S, r); (S, S)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 0, 1, 1, 1, 1],  # (S (S w)  ncons_nt=2 -> no more reduce
+              [1, 1, 1, 0, 0, 0]],  # (S w w)
+             [[1, 0, 1, 1, 1, 1],  # (S (S w)  ncons_nt=2 -> no more reduce
+              [1, 1, 0, 1, 1, 1]]]))  # (S w (S w
+
+        do_action(torch.tensor([[1, 3], [1, 2]]))  # (shift, finish); (shift, r)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 0, 1, 0, 0],  # (S (S w) w
+              [1, 1, 1, 1, 1, 1]],  # (S w w) finish
+             [[1, 1, 0, 1, 0, 0],  # (S (S w) w
+              [1, 1, 0, 1, 0, 0]]]))  # (S w (S w)
+
+        do_action(torch.tensor([[4, 0], [4, 4]]))  # (S, -); (S, S)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 0, 1, 1, 1],  # (S (S w) (S w
+              [1, 1, 1, 1, 1, 1]],  # (S w w) finish
+             [[1, 1, 0, 1, 1, 1],  # (S (S w) (S w
+              [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S w) ncons_nt=2 -> still can reduce (since sentence final)
+
+        do_action(torch.tensor([[2, 0], [2, 2]]))  # (r, -); (r, r)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 0, 1, 0, 0],  # (S (S w) (S w)
+              [1, 1, 1, 1, 1, 1]],
+             [[1, 1, 0, 1, 0, 0],  # (S (S w) (S w)   # max_cons_nts = 3 -> not sent end -> still can open
+              [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S w)) ncons_nt=2 -> no more nt
+
+        do_action(torch.tensor([[4, 0], [2, 4]]))  # (S, -); (r, S)
+        mask = model.invalid_action_mask(beam, sent_len)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 0, 1, 1, 1],  # (S (S w) (S (S w)
+              [1, 1, 1, 1, 1, 1]],
+             [[1, 1, 1, 0, 0, 0],  # (S (S w) (S w))   # max_cons_nts = 3 -> no more reduce
+              [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S (S w))
+
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
         nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]
         a_dict = TopDownActionDict(nts)
         return FixedStackRNNG(a_dict, vocab=vocab, w_dim=w_dim, h_dim=h_dim, num_layers=num_layers)
+
+    def _get_simple_in_order_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
+        nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]
+        a_dict = InOrderActionDict(nts)
+        return FixedStackInOrderRNNG(a_dict, vocab=vocab, w_dim=w_dim, h_dim=h_dim, num_layers=num_layers)
 
     def _trees_to_actions(self, trees):
         def conv(a):

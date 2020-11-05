@@ -4,11 +4,11 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
 
-from fixed_stack_models import FixedStack, FixedStackRNNG, TopDownState
+from fixed_stack_models import BeamItems, FixedStack, FixedStackRNNG, TopDownState, StackState
 
 class FixedInOrderStack(FixedStack):
-  def __init__(self, initial_hidden, stack_size, input_size):
-    super(FixedInOrderStack, self).__init__(initial_hidden, stack_size, input_size)
+  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
+    super(FixedInOrderStack, self).__init__(initial_hidden, stack_size, input_size, beam_size)
 
   def do_nt(self, nt_batches, nt_embs, nt_ids):
     left_corner = self.trees[nt_batches + (self.top_position[nt_batches]-1,)]
@@ -19,6 +19,28 @@ class FixedInOrderStack(FixedStack):
     self.nt_ids[nt_batches + (self.nt_index_pos[nt_batches],)] = nt_ids
     self.top_position[nt_batches] = self.top_position[nt_batches] + 1
     self.nt_index[nt_batches + (self.nt_index_pos[nt_batches],)] = self.top_position[nt_batches] - 1
+
+
+class InOrderStackState(StackState):
+  def __init__(self, batch_size, beam_size, device):
+    super(InOrderStackState, self).__init__(batch_size, beam_size, device)
+
+  def update_nt_counts(self, actions, action_dict, action_path):
+    shift_idxs = (actions == action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
+    nt_idxs = (actions >= action_dict.nt_begin_id()).nonzero(as_tuple=True)
+    reduce_idxs = (actions == action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
+    prev_is_not_nt = (action_path.prev_actions() < action_dict.nt_begin_id())
+
+    self.ncons_nts[shift_idxs] = 0
+    self.nopen_parens[nt_idxs] += 1
+    self.ncons_nts[nt_idxs] += 1
+    self.nopen_parens[reduce_idxs] -= 1
+
+    # To regard repetitive nt->reduce->nt->reduce ... as cons nts,
+    # we don't reset ncons_nts if previous action is nt.
+    reset_ncons_reduce_mask = (actions == action_dict.a2i['REDUCE']) * (prev_is_not_nt)
+    self.ncons_nts[reset_ncons_reduce_mask] = 0
+
 
 class FixedStackInOrderRNNG(FixedStackRNNG):
   def __init__(self, action_dict,
@@ -39,124 +61,72 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
 
   def build_stack(self, x, batch_size = None):
     stack_size = max(150, x.size(1) + 100)
-    batch_size = batch_size or x.size(0)
     initial_hidden = self.rnng.get_initial_hidden(x)
     return FixedInOrderStack(initial_hidden, stack_size, self.input_size)
 
-  def initial_states(self, x, initial_stack = None):
-    initial_hidden = self.rnng.get_initial_hidden(x)  # [(batch_size, hidden_size), (batch_size, hidden_size)]
-    return [InOrderState.from_initial_stack((initial_hidden[0][b], initial_hidden[1][b]))
-            for b in range(x.size(0))]
+  def new_beam_stack_with_state(self, initial_hidden, stack_size, beam_size):
+    stack = FixedInOrderStack(initial_hidden, stack_size, self.input_size, beam_size)
+    stack_state = InOrderStackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
+    return stack, stack_state
 
-  def valid_action_mask(self, items, sent_len):
-    mask = torch.ones((len(items), self.num_actions), dtype=torch.uint8)
-    mask[:, self.action_dict.padding_idx] = 0
-    for b, item in enumerate(items):
-      state = item.state
-      prev_action = item.action
-      if state.finished():
-        mask[b, :] = 0
-        continue
-      can_finish = state.pointer == sent_len and state.nopen_parens == 0
-      if not can_finish:
-        self.action_dict.mask_finish(mask, b)
-      if state.pointer == sent_len:
-        self.action_dict.mask_shift(mask, b)
-      if state.nopen_parens == 0:
-        self.action_dict.mask_reduce(mask, b)
-        if state.pointer > 0:
-          # Only stack element is left-corner.
-          # Its parent has to be predicted immediately (only nt is valid).
-          self.action_dict.mask_shift(mask, b)
+  def invalid_action_mask(self, beam, sent_len):
+    action_order = torch.arange(self.num_actions, device=beam.nopen_parens.device)
 
-      if len(state.hiddens) == 1 or self.action_dict.is_nt(prev_action):
-        # successive nts is prohibited; it may lead to a valid parse, but
-        # the same structure can always be achieved by finishing a left subtree,
-        # followed by that nt.
-        self.action_dict.mask_nt(mask, b)
+    nopen_parens = beam.nopen_parens
+    ncons_nts = beam.ncons_nts
+    pointer = beam.stack.pointer
+    top_position = beam.stack.top_position
+    prev_actions = beam.prev_actions()
 
-      if state.nopen_parens > self.max_open_nts-1 or state.ncons_nts > self.max_cons_nts-1:
-        # For in-order, cons_nts is accumuated by the loop of nt->reduce.
-        # Except sentence final, we prohibit reduce to break this loop. Otherwise,
-        # we fall into the state of one element in the stack, which prohibits following
-        # shift (-> no way to escape).
-        #
-        # We instead prohibit nt for sentence final, because we need to close all
-        # incomplete brackets.
-        if state.pointer < sent_len:
-          self.action_dict.mask_reduce(mask, b)
-        else:
-          self.action_dict.mask_nt(mask, b)
+    # For in-order, cons_nts is accumuated by the loop of nt->reduce.
+    # Except sentence final, we prohibit reduce to break this loop. Otherwise,
+    # we fall into the state of one element in the stack, which prohibits following
+    # shift (-> no way to escape).
+    #
+    # We instead prohibit nt for sentence final, because we need to close all
+    # incomplete brackets.
+    # This mask is a precondition used both for reduce_mask and reduce_nt
+    # (depending on sentence final or not).
+    pre_nt_reduce_mask = ((nopen_parens > self.max_open_nts-1) +
+                          (ncons_nts > self.max_cons_nts-1))
 
-    mask = mask.to(items[0].state.hiddens[0][0][0].device)
+    # reduce_mask[i,j,k]=True means k is a not allowed reduce action for (i,j).
+    reduce_mask = (action_order == self.action_dict.a2i['REDUCE']).view(1, 1, -1)
+    reduce_mask = (((nopen_parens == 0) +
+                    (pre_nt_reduce_mask * (pointer < sent_len))).unsqueeze(-1) *
+                   reduce_mask)
 
-    return mask
+    finish_mask = (action_order == self.action_dict.finish_action()).view(1, 1, -1)
+    finish_mask = (((pointer != sent_len) + (nopen_parens != 0)).unsqueeze(-1) *
+                   finish_mask)
 
-  def _is_last_action(self, action, state, shifted_all):
-    return self.action_dict.is_finish(action)
+    shift_mask = (action_order == self.action_dict.a2i['SHIFT']).view(1, 1, -1)
+    shift_mask = (((pointer == sent_len) +
+                   ((pointer > 0) * (nopen_parens == 0)) +
+                   # when nopen=0, shift accompanies nt, thus requires two.
+                   ((nopen_parens == 0) * (top_position >= beam.stack.stack_size-2)) +
+                   # otherwise, requires one room.
+                   ((nopen_parens > 0) * (top_position >= beam.stack.stack_size-1))).unsqueeze(-1) *
+                  shift_mask)
 
+    nt_mask = (action_order >= self.action_dict.nt_begin_id()).view(1, 1, -1)
+    prev_is_nt = prev_actions >= self.action_dict.nt_begin_id()
+    nt_mask = ((prev_is_nt +
+                (top_position == 0) +
+                # prohibit nt version of pre_nt_reduce_mask (reduce is prohibited except empty buffer)
+                (pre_nt_reduce_mask * (pointer == sent_len)) +
+                # reduce is allowed after nt, so minimal room for stack is 1.
+                (top_position >= beam.stack.stack_size-1) +
+                # +1 for final finish.
+                (beam.actions.size(2) - beam.actions_pos < (
+                  sent_len - beam.stack.pointer + beam.nopen_parens + 1))).unsqueeze(-1) *
+               nt_mask)
 
-class InOrderState(TopDownState):
-  def __init__(self,
-               pointer = 0,
-               hiddens = None,
-               cells = None,
-               stack_trees = None,
-               nopen_parens = 0,
-               ncons_nts = 0,
-               nt_index = None,
-               nt_ids = None,
-               prev_a = 0,
-               is_finished = False):
-    super(InOrderState, self).__init__(
-      pointer, hiddens, cells, stack_trees, nopen_parens, ncons_nts, nt_index, nt_ids)
+    pad_mask = (action_order == self.action_dict.padding_idx).view(1, 1, -1)
+    finished_mask = ((prev_actions == self.action_dict.finish_action()) +
+                     (prev_actions == self.action_dict.padding_idx)).unsqueeze(-1)
+    beam_width_mask = (torch.arange(beam.beam_size, device=reduce_mask.device).unsqueeze(0) >=
+                       beam.beam_widths.unsqueeze(1)).unsqueeze(-1)
 
-    self.prev_a = prev_a
-    self.is_finished = is_finished
-
-  def can_finish_by_reduce(self):
-    # Ending by reduce is only valid for top-down so this action is only valid
-    # for top-down.
-    return False
-
-  def can_finish_by_finish(self):
-    return self.nopen_parens == 0
-
-  def finished(self):
-    return self.is_finished
-
-  def copy(self):
-    return InOrderState(self.pointer, self.hiddens[:], self.cells[:], self.stack_trees[:],
-                        self.nopen_parens, self.ncons_nts, self.nt_index[:],
-                        self.nt_ids[:], self.prev_a, self.is_finished)
-
-  def do_action(self, a, action_dict):
-    if action_dict.is_shift(a):
-      self.pointer += 1
-      self.ncons_nts = 0
-    elif action_dict.is_nt(a):
-      nt_id = action_dict.nt_id(a)
-      self.nopen_parens += 1
-      self.ncons_nts += 1
-      self.nt_index.append(len(self.hiddens) - 2)  # already swapped
-      self.nt_ids.append(nt_id)
-    elif action_dict.is_reduce(a):
-      self.nopen_parens -= 1
-      # To regard repetitive nt->reduce->nt->reduce ... as cons nts,
-      # we don't reset ncons_nts if previous action is nt.
-      self.ncons_nts = self.ncons_nts if action_dict.is_nt(self.prev_a) else 0
-    elif action_dict.is_finish(a):
-      self.is_finished = True
-
-    self.prev_a = a
-
-  def update_stack(self, new_stack_top, new_tree_elem, action, action_dict):
-    self.hiddens.append(new_stack_top[0])
-    self.cells.append(new_stack_top[1])
-    if action_dict.is_nt(action):
-      left_corner = self.stack_trees.pop()
-      self.stack_trees.extend([new_tree_elem, left_corner])
-    else:
-      self.stack_trees.append(new_tree_elem)
-
-
+    return (reduce_mask + finish_mask + shift_mask + nt_mask + pad_mask + finished_mask +
+            beam_width_mask)
