@@ -130,3 +130,6 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
 
     return (reduce_mask + finish_mask + shift_mask + nt_mask + pad_mask + finished_mask +
             beam_width_mask)
+
+  def _parse_finish_mask(self, beam, action_id, beam_id):
+    return action_id == self.action_dict.finish_action()

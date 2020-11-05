@@ -551,6 +551,22 @@ class TestFixedStackModels(unittest.TestCase):
              [[1, 1, 1, 0, 0, 0],  # (S (S w) (S w))   # max_cons_nts = 3 -> no more reduce
               [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S (S w))
 
+    def test_in_order_beam_search(self):
+        model = self._get_simple_in_order_model()
+        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+        self.assertEqual(len(parses), 2)
+        self.assertEqual(len(parses[0]), 5)
+
+        paths = set([tuple(parse) for parse, score in parses[0]])
+        self.assertEqual(len(paths), 5)
+
+        for parse, score in parses[0]:
+            print([model.action_dict.i2a[action] for action in parse])
+        print(surprisals[0])
+        self.assertEqual([len(s) for s in surprisals], [3, 3])
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
         nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]
         a_dict = TopDownActionDict(nts)

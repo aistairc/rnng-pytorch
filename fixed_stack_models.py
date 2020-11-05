@@ -1003,10 +1003,7 @@ class FixedStackRNNG(nn.Module):
     if pointer < x.size(1):  #
       end_action_mask = action_id == self.action_dict.a2i['SHIFT']
     else:
-      # top_down specific masking; should be separated in a function and adjusted for in_order.
-      pre_final_mask = beam.nopen_parens.gather(1, beam_id) == 1
-      end_action_mask = action_id == self.action_dict.finish_action()
-      end_action_mask = end_action_mask * pre_final_mask
+      end_action_mask = self._parse_finish_mask(beam, action_id, beam_id)
 
     end_action_mask = valid_action_mask * end_action_mask
     no_end_action_mask = valid_action_mask * (end_action_mask != 1)
@@ -1058,6 +1055,11 @@ class FixedStackRNNG(nn.Module):
             successor_idx_to_successors(end_successor_idx),
             num_forced_completions)
 
+  def _parse_finish_mask(self, beam, action_id, beam_id):
+    pre_final_mask = beam.nopen_parens.gather(1, beam_id) == 1
+    end_action_mask = action_id == self.action_dict.finish_action()
+    end_action_mask = end_action_mask * pre_final_mask
+    return end_action_mask
 
 class TopDownState:
   """
