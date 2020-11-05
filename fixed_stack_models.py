@@ -273,7 +273,7 @@ class StackState:
     self.ncons_nts = torch.gather(self.ncons_nts, 1, sort_idx)
     self.nopen_parens = torch.gather(self.nopen_parens, 1, sort_idx)
 
-  def update_nt_counts(self, actions, action_dict):
+  def update_nt_counts(self, actions, action_dict, action_path = None):
     shift_idxs = (actions == action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
     nt_idxs = (actions >= action_dict.nt_begin_id()).nonzero(as_tuple=True)
     reduce_idxs = (actions == action_dict.a2i['REDUCE']).nonzero(as_tuple=True)
@@ -283,6 +283,40 @@ class StackState:
     self.ncons_nts[nt_idxs] += 1
     self.nopen_parens[reduce_idxs] -= 1
     self.ncons_nts[reduce_idxs] = 0
+
+
+class ActionPath:
+  def __init__(self, batch_size, beam_size, max_actions, device):
+    self.actions = torch.full((batch_size, beam_size, max_actions), -1, dtype=torch.long, device=device)
+    self.actions_pos = self.actions.new_zeros(batch_size, beam_size)
+
+  def prev_actions(self):
+    return self.actions.gather(2, self.actions_pos.unsqueeze(-1)).squeeze(-1)  # (batch_size, beam_size)
+
+  def nbest_parses(self, beam_widths, gen_ll):
+    widths = beam_widths.cpu().numpy()
+    actions = self.actions.cpu().numpy()
+    actions_pos = self.actions_pos.cpu().numpy()
+    def tree_actions(batch, beam):
+      return (actions[batch, beam, 1:actions_pos[batch, beam]+1], gen_ll[batch, beam].item())
+
+    def batch_actions(batch):
+      return [tree_actions(batch, i) for i in range(widths[batch])]
+
+    return [batch_actions(b) for b in range(len(widths))]
+
+  def move_beams(self, self_idxs, source, source_idxs):
+    self.actions[self_idxs] = source.actions[source_idxs]
+    self.actions_pos[self_idxs] = source.actions_pos[source_idxs]
+
+  def sort_by(self, sort_idx):
+    self.actions = torch.gather(self.actions, 1,
+                                sort_idx.unsqueeze(-1).expand(self.actions.size()))
+    self.actions_pos = torch.gather(self.actions_pos, 1, sort_idx)
+
+  def add(self, actions, active_idxs):
+    self.actions_pos[active_idxs] += 1
+    self.actions[active_idxs + (self.actions_pos[active_idxs],)] = actions[active_idxs]
 
 
 class BeamItems:
@@ -305,8 +339,8 @@ class BeamItems:
     else:
       self.beam_widths = self.gen_ll.new_ones(self.batch_size, dtype=torch.long)
 
-    self.actions = self.beam_widths.new_full((self.batch_size, self.beam_size, max_actions), -1)
-    self.actions_pos = self.beam_widths.new_zeros(self.batch_size, self.beam_size)
+    self.action_path = ActionPath(self.batch_size, self.beam_size, max_actions,
+                                  self.beam_widths.device)
 
   @property
   def ncons_nts(self):
@@ -316,20 +350,19 @@ class BeamItems:
   def nopen_parens(self):
     return self.stack_state.nopen_parens
 
+  @property
+  def actions(self):
+    return self.action_path.actions
+
+  @property
+  def actions_pos(self):
+    return self.action_path.actions_pos
+
   def prev_actions(self):
-    return self.actions.gather(2, self.actions_pos.unsqueeze(-1)).squeeze(-1)  # (batch_size, beam_size)
+    return self.action_path.prev_actions()
 
   def nbest_parses(self):
-    widths = self.beam_widths.cpu().numpy()
-    actions = self.actions.cpu().numpy()
-    actions_pos = self.actions_pos.cpu().numpy()
-    def tree_actions(batch, beam):
-      return (actions[batch, beam, 1:actions_pos[batch, beam]+1], self.gen_ll[batch, beam].item())
-
-    def batch_actions(batch):
-      return [tree_actions(batch, i) for i in range(widths[batch])]
-
-    return [batch_actions(b) for b in range(len(widths))]
+    return self.action_path.nbest_parses(self.beam_widths, self.gen_ll)
 
   def shrink(self, size):
     outside_beam_idx = (torch.arange(self.beam_size, device=self.gen_ll.device).unsqueeze(0) >=
@@ -339,10 +372,11 @@ class BeamItems:
     self.disc_ll = torch.gather(self.disc_ll, 1, sort_idx)
     self.stack.sort_by(sort_idx)
     self.stack_state.sort_by(sort_idx)
+    self.action_path.sort_by(sort_idx)
     self.beam_widths = torch.min(self.beam_widths, self.beam_widths.new_tensor([size]))
 
-    self.actions = torch.gather(self.actions, 1, sort_idx.unsqueeze(-1).expand(self.actions.size()))
-    self.actions_pos = torch.gather(self.actions_pos, 1, sort_idx)
+    # self.actions = torch.gather(self.actions, 1, sort_idx.unsqueeze(-1).expand(self.actions.size()))
+    # self.actions_pos = torch.gather(self.actions_pos, 1, sort_idx)
 
   def active_idxs(self):
     """
@@ -444,16 +478,12 @@ class BeamItems:
 
     self.stack_state.move_beams(self_idxs, source.stack_state, source_idxs)
     self.stack.move_beams(self_idxs, source.stack, source_idxs)
-
-    self.actions[self_idxs] = source.actions[source_idxs]
-    self.actions_pos[self_idxs] = source.actions_pos[source_idxs]
+    self.action_path.move_beams(self_idxs, source.action_path, source_idxs)
 
   def do_action(self, actions, action_dict):
-    active_idxs = self.active_idxs()
-    self.actions_pos[active_idxs] += 1
-    self.actions[active_idxs + (self.actions_pos[active_idxs],)] = actions[active_idxs]
-
-    self.stack_state.update_nt_counts(actions, action_dict)
+    # We need to use "unupdated" action_path for updating stack_state.
+    self.stack_state.update_nt_counts(actions, action_dict, self.action_path)
+    self.action_path.add(actions, self.active_idxs())
 
 
 class RNNGCell(nn.Module):
@@ -651,7 +681,6 @@ class FixedStackRNNG(nn.Module):
 
       def word_finished_batches():
         return ((beam.beam_widths == 0) +  # Empty beam means no action remains (finished).
-                #(word_completed_beam.beam_widths >= (word_completed_beam.beam_size - 1)) +
                 (word_completed_beam.beam_widths >= word_completed_beam.beam_size) +
                 ((word_completed_beam.beam_widths - forced_completions) >= beam_size))
 
@@ -727,18 +756,18 @@ class FixedStackRNNG(nn.Module):
     stack_size = min(int(x.size(1)*2.5), 104)
     stack_size = math.ceil(stack_size / 8) * 8  # force to be multiple of 8.
     initial_hidden = self.rnng.get_initial_hidden(x)
-    stack_unfinished, state_unfinished = self.new_stack_with_state(
+    stack_unfinished, state_unfinished = self.new_beam_stack_with_state(
       initial_hidden, stack_size, beam_size)
     # The rationale behind (+shift_size*5) for beam size for finished BeamItems is
     # that # steps between words would probably be ~5 in most cases. Forcing to save shifts
     # after this many steps seems to be unnecessary.
-    stack_word_finished, state_word_finished = self.new_stack_with_state(
+    stack_word_finished, state_word_finished = self.new_beam_stack_with_state(
       initial_hidden, stack_size, min(beam_size * 2, beam_size + shift_size*5))
     max_actions = max(100, x.size(1) * 5)
     return (BeamItems(stack_unfinished, state_unfinished, max_actions, False),
             BeamItems(stack_word_finished, state_word_finished, max_actions, True))
 
-  def new_stack_with_state(self, initial_hidden, stack_size, beam_size):
+  def new_beam_stack_with_state(self, initial_hidden, stack_size, beam_size):
     stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
     stack_state = StackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
@@ -1107,105 +1136,105 @@ class TopDownState:
     self.cells.append(new_stack_top[1])
     self.stack_trees.append(new_tree_elem)
 
-class ActionPath:
-  def __init__(self, prev=None, action=0, score=0.0, local_word_ll=0.0):
-    self.prev = prev
-    self.action = action
-    self.score = score
-    self.local_word_ll = local_word_ll
+# class ActionPath:
+#   def __init__(self, prev=None, action=0, score=0.0, local_word_ll=0.0):
+#     self.prev = prev
+#     self.action = action
+#     self.score = score
+#     self.local_word_ll = local_word_ll
 
-  def add_action(self, action, score, local_word_ll=0.0):
-    return ActionPath(self, action, score, local_word_ll)
+#   def add_action(self, action, score, local_word_ll=0.0):
+#     return ActionPath(self, action, score, local_word_ll)
 
-  def foreach(self, f):
-    f(self)
-    if self.prev is not None:
-      self.prev.foreach(f)
+#   def foreach(self, f):
+#     f(self)
+#     if self.prev is not None:
+#       self.prev.foreach(f)
 
-  def incorporate_word_ll(self):
-    self.local_word_ll < 0
-    self.score += self.local_word_ll
+#   def incorporate_word_ll(self):
+#     self.local_word_ll < 0
+#     self.score += self.local_word_ll
 
-class BeamItem:
-  def __init__(self, state, action_path):
-    self.state = state
-    self.action_path = action_path
-    self.action = self.action_path.action
+# class BeamItem:
+#   def __init__(self, state, action_path):
+#     self.state = state
+#     self.action_path = action_path
+#     self.action = self.action_path.action
 
-  @property
-  def score(self):
-    return self.action_path.score
+#   @property
+#   def score(self):
+#     return self.action_path.score
 
-  def do_action(self, action_dict):
-    self.state.do_action(self.action, action_dict)
+#   def do_action(self, action_dict):
+#     self.state.do_action(self.action, action_dict)
 
-  @staticmethod
-  def from_initial_state(initial_state):
-    path = ActionPath()  # initial action is 0 (pad)
-    return BeamItem(initial_state, path)
+#   @staticmethod
+#   def from_initial_state(initial_state):
+#     path = ActionPath()  # initial action is 0 (pad)
+#     return BeamItem(initial_state, path)
 
-  def parse_actions(self):
-    actions = []
-    def add_action(path):
-      actions.append(path.action)
-    self.action_path.foreach(add_action)
-    assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
-    return list(reversed(actions[:-1]))
+#   def parse_actions(self):
+#     actions = []
+#     def add_action(path):
+#       actions.append(path.action)
+#     self.action_path.foreach(add_action)
+#     assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
+#     return list(reversed(actions[:-1]))
 
-  def next_incomplete_item(self, action, score, local_word_ll=0.0):
-    state = self.state.copy()
-    path = self.action_path.add_action(action, score, local_word_ll)
-    return BeamItem(state, path)
+#   def next_incomplete_item(self, action, score, local_word_ll=0.0):
+#     state = self.state.copy()
+#     path = self.action_path.add_action(action, score, local_word_ll)
+#     return BeamItem(state, path)
 
-  def dump(self, action_dict, sent):
-    actions = self.parse_actions()
-    stack_str = action_dict.build_tree_str(
-      actions, sent.orig_tokens, ["" for _ in range(len(sent.orig_tokens))])
-    return "[{}]; {:.2f}; a={}, ".format(stack_str, self.score, self.action)
+#   def dump(self, action_dict, sent):
+#     actions = self.parse_actions()
+#     stack_str = action_dict.build_tree_str(
+#       actions, sent.orig_tokens, ["" for _ in range(len(sent.orig_tokens))])
+#     return "[{}]; {:.2f}; a={}, ".format(stack_str, self.score, self.action)
 
-class ParticlePath:
-  def __init__(self, K, prev=None, action=0, gen_ll=0.0, disc_ll=0.0):
-    self.K = K
-    self.prev = prev
-    self.action = action
-    self.gen_ll = gen_ll
-    self.disc_ll = disc_ll
+# class ParticlePath:
+#   def __init__(self, K, prev=None, action=0, gen_ll=0.0, disc_ll=0.0):
+#     self.K = K
+#     self.prev = prev
+#     self.action = action
+#     self.gen_ll = gen_ll
+#     self.disc_ll = disc_ll
 
-  def add_action(self, action, K, gen_local_score, disc_local_score):
-    return ParticlePath(K, self, action, self.gen_ll+gen_local_score, self.disc_ll+disc_local_score)
+#   def add_action(self, action, K, gen_local_score, disc_local_score):
+#     return ParticlePath(K, self, action, self.gen_ll+gen_local_score, self.disc_ll+disc_local_score)
 
-  def reweight(self, new_K):
-    self.K = new_K
+#   def reweight(self, new_K):
+#     self.K = new_K
 
-  def foreach(self, f):
-    f(self)
-    if self.prev is not None:
-      self.prev.foreach(f)
+#   def foreach(self, f):
+#     f(self)
+#     if self.prev is not None:
+#       self.prev.foreach(f)
 
-class ParticleBeamItem:
-  def __init__(self, state, particle_path):
-    self.state = state
-    self.particle_path = particle_path
-    self.action = self.particle_path.action
+# class ParticleBeamItem:
+#   def __init__(self, state, particle_path):
+#     self.state = state
+#     self.particle_path = particle_path
+#     self.action = self.particle_path.action
 
-  @property
-  def score(self):
-    return self.particle_path.gen_ll
+#   @property
+#   def score(self):
+#     return self.particle_path.gen_ll
 
-  @staticmethod
-  def from_initial_state(initial_state, K):
-    path = ParticlePath(K)  # initial action is 0 (pad)
-    return ParticleBeamItem(initial_state, path)
+#   @staticmethod
+#   def from_initial_state(initial_state, K):
+#     path = ParticlePath(K)  # initial action is 0 (pad)
+#     return ParticleBeamItem(initial_state, path)
 
-  def parse_actions(self):
-    actions = []
-    def add_action(path):
-      actions.append(path.action)
-    self.particle_path.foreach(add_action)
-    assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
-    return list(reversed(actions[:-1]))
+#   def parse_actions(self):
+#     actions = []
+#     def add_action(path):
+#       actions.append(path.action)
+#     self.particle_path.foreach(add_action)
+#     assert actions[-1] == 0  # last (= initial after revsed) is pad (dummy)
+#     return list(reversed(actions[:-1]))
 
-  def next_incomplete_item(self, action, K, log_prob, disc_log_prob):
-    state = self.state.copy()
-    path = self.particle_path.add_action(action, K, log_prob, disc_log_prob)
-    return ParticleBeamItem(state, path)
+#   def next_incomplete_item(self, action, K, log_prob, disc_log_prob):
+#     state = self.state.copy()
+#     path = self.particle_path.add_action(action, K, log_prob, disc_log_prob)
+#     return ParticleBeamItem(state, path)
