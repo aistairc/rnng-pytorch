@@ -143,7 +143,7 @@ class TestFixedStackModels(unittest.TestCase):
 
         orig_hiddens = beam.stack.hiddens.clone()
 
-        new_beam_idx = beam.reconstruct(reconstruct_idx)
+        new_beam_idx, _ = beam.reconstruct(reconstruct_idx)
         self.assertTensorAlmostEqual(new_beam_idx[0], torch.tensor([0, 0, 0, 1, 1]))
         self.assertTensorAlmostEqual(new_beam_idx[1], torch.tensor([0, 1, 2, 0, 1]))
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([3, 2]))
@@ -165,7 +165,7 @@ class TestFixedStackModels(unittest.TestCase):
         # second reconstruction
         reconstruct_idx = (torch.tensor([0, 0, 0, 1, 1, 1]), torch.tensor([2, 2, 0, 1, 1, 1]))
         orig_hiddens = beam.stack.hiddens.clone()
-        new_beam_idx = beam.reconstruct(reconstruct_idx)
+        new_beam_idx, _ = beam.reconstruct(reconstruct_idx)
         self.assertTensorAlmostEqual(new_beam_idx[0], torch.tensor([0, 0, 0, 1, 1, 1]))
         self.assertTensorAlmostEqual(new_beam_idx[1], torch.tensor([0, 1, 2, 0, 1, 2]))
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([3, 3]))
@@ -182,7 +182,7 @@ class TestFixedStackModels(unittest.TestCase):
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 3, 1)  # beam_size = 3
         reconstruct_idx = (torch.tensor([0, 0, 0, 1, 1, 1]), torch.tensor([0, 0, 0, 0, 0, 0]))
-        new_beam_idx = beam.reconstruct(reconstruct_idx)
+        new_beam_idx, _ = beam.reconstruct(reconstruct_idx)
         actions = torch.tensor([[3, 4, 1], [4, 1, 3]])  # (S, NP, shift); (NP, shift, S)
         model.rnng(word_vecs, actions, beam.stack)
         beam.do_action(actions, model.action_dict)
@@ -228,7 +228,7 @@ class TestFixedStackModels(unittest.TestCase):
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 3, 1)  # beam_size = 3
         reconstruct_idx = (torch.tensor([0, 0, 0, 1]), torch.tensor([0, 1, 2, 0]))
-        new_beam_idx = beam.reconstruct(reconstruct_idx)
+        new_beam_idx, _ = beam.reconstruct(reconstruct_idx)
         actions = torch.tensor([[3, 4, 1], [4, 0, 0]])  # (S, NP, shift); (NP, shift, S)
         model.rnng(word_vecs, actions, beam.stack)
         beam.do_action(actions, model.action_dict)
@@ -356,7 +356,7 @@ class TestFixedStackModels(unittest.TestCase):
                 comp_idxs = tuple(word_completed_successors[0][:2])
                 moved_idxs = word_completed_beam.move_items_from(
                     beam, comp_idxs, new_gen_ll=word_completed_successors[2])
-            new_beam_idxs = beam.reconstruct(successors[0][:2])
+            new_beam_idxs, _ = beam.reconstruct(successors[0][:2])
             beam.gen_ll[new_beam_idxs] = successors[2]
             actions = successors[1].new_full((x.size(0), beam_size), model.action_dict.padding_idx)
             actions[new_beam_idxs] = successors[1]
@@ -567,6 +567,23 @@ class TestFixedStackModels(unittest.TestCase):
         self.assertEqual([len(s) for s in surprisals], [3, 3])
         self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
+    def test_variable_beam_search(self):
+        model = self._get_simple_top_down_model()
+        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+        parses, surprisals = model.variable_beam_search(x, 50)
+
+        self.assertEqual(len(parses), 2)
+        self.assertTrue(len(parses[0]) > 0)
+
+        paths = set([tuple(parse) for parse, score in parses[0]])
+        self.assertEqual(len(paths), len(parses[0]))
+
+        for parse, score in parses[0]:
+            print([model.action_dict.i2a[action] for action in parse])
+        print(surprisals[0])
+        self.assertEqual([len(s) for s in surprisals], [3, 3])
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
         nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]
         a_dict = TopDownActionDict(nts)
@@ -595,7 +612,7 @@ class TestFixedStackModels(unittest.TestCase):
     def assertBeamEqual(self, beam1, beam2, idx1, idx2, check_scores = False):
         attrs = ['actions', 'actions_pos', 'ncons_nts', 'nopen_parens']
         if check_scores:
-            attrs += ['gen_ll', 'disc_ll']
+            attrs += ['gen_ll']
         stack_attrs = ['pointer', 'top_position', 'hiddens', 'cells', 'trees',
                        'nt_index', 'nt_ids', 'nt_index_pos']
         for a in attrs:

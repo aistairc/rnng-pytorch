@@ -4,7 +4,7 @@ import torch.nn.functional as F
 from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 import numpy as np
 
-from fixed_stack_models import BeamItems, FixedStack, FixedStackRNNG, TopDownState, StackState
+from fixed_stack_models import BeamItems, FixedStack, FixedStackRNNG, StackState
 
 class FixedInOrderStack(FixedStack):
   def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
@@ -60,7 +60,7 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
                                       max_open_nts, max_cons_nts)
 
   def build_stack(self, x, batch_size = None):
-    stack_size = max(150, x.size(1) + 100)
+    stack_size = max(150, x.size(1) + 10)
     initial_hidden = self.rnng.get_initial_hidden(x)
     return FixedInOrderStack(initial_hidden, stack_size, self.input_size)
 

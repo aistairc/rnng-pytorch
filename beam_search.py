@@ -37,6 +37,8 @@ parser.add_argument('--shift_size', type=int, default=5)
 parser.add_argument('--batch_size', type=int, default=5)
 parser.add_argument('--block_size', type=int, default=100)
 parser.add_argument('--batch_token_size', type=int, default=300)
+parser.add_argument('--stack_size_bound', type=int, default=-1,
+                    help='Stack size during search is bounded by this size. If <= 0, the maximum size grows by sentence length (set by `sentence_length+10`). 100 looks sufficient for most of the grammars. Bounding to some value (e.g., 100) is useful to reduce memory usage while increasing beam size.')
 parser.add_argument('--delay_word_ll', action='store_true',
                     help='Adding shift word probability is delayed at word-synchronizing step')
 parser.add_argument('--particle_filter', action='store_true', help='search with particle filter')
@@ -104,12 +106,14 @@ def main(args):
 
   if args.particle_filter:
     def parse(model, tokens, return_beam_history=False):
-      return model.variable_beam_search(tokens, args.particle_size, args.original_reweight)
+      return model.variable_beam_search(tokens, args.particle_size, args.original_reweight,
+                                        stack_size_bound=args.stack_size_bound)
   else:
     def parse(model, tokens, return_beam_history=False):
       return model.word_sync_beam_search(
         tokens, args.beam_size, args.word_beam_size, args.shift_size, args.delay_word_ll,
-        return_beam_history=return_beam_history)
+        return_beam_history=return_beam_history,
+        stack_size_bound=args.stack_size_bound)
 
   with torch.no_grad():
 
