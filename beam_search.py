@@ -111,7 +111,7 @@ def main(args):
   else:
     def parse(model, tokens, return_beam_history=False):
       return model.word_sync_beam_search(
-        tokens, args.beam_size, args.word_beam_size, args.shift_size, args.delay_word_ll,
+        tokens, args.beam_size, args.word_beam_size, args.shift_size,
         return_beam_history=return_beam_history,
         stack_size_bound=args.stack_size_bound)
 
