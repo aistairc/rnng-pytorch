@@ -9,7 +9,7 @@ We first convert a PTB-style dataset (examples found in `data/` folder) into a s
 $ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
 --outputfile data/ptb --vocabminfreq 1 --unkmethod berkeleyrule
 ```
-By `--unkmethod berkeleyrule`, an unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indidates an unknown token ending with `ly` suffix (e.g., nominally).
+By `--unkmethod berkeleyrule`, an unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indicates an unknown token ending with `ly` suffix (e.g., nominally).
 
 The outputs are `data/ptb-train.json`, `data/ptb-val.json`, and `data/ptb-test.json`. Vocabulary is defined by tokens in the training data. Which tokens to include in the vocabulary is decided by `--vocabminfreq` or `--vocabsize` argument (see `python preprocess.py --help`).
 
@@ -19,7 +19,7 @@ The current implementation is hard-coded for running on a single GPU.
 Example to train a model:
 ```
 $ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json --save_path rnng.pt
---fixed_stack --strategy top_down --dropout 0.3 --optimizer adam --lr 0.01 --gpu 0
+--fixed_stack --strategy top_down --dropout 0.3 --optimizer adam --lr 0.001 --gpu 0
 ```
 
 ### Training Tips

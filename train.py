@@ -50,7 +50,7 @@ parser.add_argument('--not_swap_in_order_stack', action='store_true',
 # Optimization options
 parser.add_argument('--batch_group', choices=['same_length', 'random', 'similar_length'],
                     default='similar_length', help='Sentences are grouped by this criterion to make each batch.')
-parser.add_argument('--optimizer', choices=['sgd', 'adam'], help='Which optimizer to use.')
+parser.add_argument('--optimizer', default='adam', choices=['sgd', 'adam'], help='Which optimizer to use.')
 parser.add_argument('--random_unk', action='store_true', help='Randomly replace a token to <unk> on training sentences by a probability inversely proportional to word frequency.')
 parser.add_argument('--batch_size', type=int, default=16)
 parser.add_argument('--batch_token_size', type=int, default=15000, help='Number of tokens in a batch (batch_size*sentence_length) does not exceed this.')
@@ -59,7 +59,7 @@ parser.add_argument('--num_epochs', default=18, type=int, help='number of traini
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
 parser.add_argument('--decay_cond_epochs', default=1, type=int, help='decay learning rate if loss does not improve conscutively this many steps')
 #parser.add_argument('--mode', default='unsupervised', type=str, choices=['unsupervised', 'supervised'])
-parser.add_argument('--lr', default=1, type=float, help='starting learning rate')
+parser.add_argument('--lr', default=0.001, type=float, help='starting learning rate')
 parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action'])
 parser.add_argument('--decay', default=0.5, type=float, help='')
 parser.add_argument('--param_init', default=0, type=float, help='parameter initialization (over uniform)')
