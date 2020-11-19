@@ -34,9 +34,10 @@ parser.add_argument('--model_file', default='rnng.pt')
 parser.add_argument('--beam_size', type=int, default=200)
 parser.add_argument('--word_beam_size', type=int, default=20)
 parser.add_argument('--shift_size', type=int, default=5)
-parser.add_argument('--batch_size', type=int, default=5)
+parser.add_argument('--batch_size', type=int, default=10, help='Please decrease this if memory error occurs.')
 parser.add_argument('--block_size', type=int, default=100)
-parser.add_argument('--batch_token_size', type=int, default=300)
+parser.add_argument('--batch_token_size', type=int, default=300,
+                    help='Number of tokens in a batch (batch_size*sentence_length) does not exceed this. This value could be large value (e.g., 10000) safely when --stack_size_bound is set to some value > 0. Otherwise, we need to control (decrease) the batch size for longer sentences using this option, because then stack_size_bound will grow by sentence length.')
 parser.add_argument('--stack_size_bound', type=int, default=-1,
                     help='Stack size during search is bounded by this size. If <= 0, the maximum size grows by sentence length (set by `sentence_length+10`). 100 looks sufficient for most of the grammars. Bounding to some value (e.g., 100) is useful to reduce memory usage while increasing beam size.')
 parser.add_argument('--delay_word_ll', action='store_true',
@@ -115,6 +116,7 @@ def main(args):
         return_beam_history=return_beam_history,
         stack_size_bound=args.stack_size_bound)
 
+  start_time = time.time()
   with torch.no_grad():
 
     block_idxs = []
@@ -153,6 +155,7 @@ def main(args):
         cur_block_size = 0
 
   sort_and_print_trees(block_idxs, block_parses, block_surprisals)
+  end_time = time.time()
 
   with open(args.lm_output_file, 'wt') as o:
     for sent_i, (sent, surp) in enumerate(zip(dataset.sents, all_surprisals)):
@@ -166,7 +169,8 @@ def main(args):
     ll = -sum([sum(surp) for surp in all_surprisals])
     num_words = sum([len(surp) for surp in all_surprisals])
     ppl = np.exp(-ll / num_words)
-    o.write('perplexity: {}'.format(ppl))
+    o.write('perplexity: {} Time: {} Throughput: {}'.format(
+      ppl, end_time - start_time, (len(dataset.sents)) / (end_time-start_time)))
 
 if __name__ == '__main__':
   args = parser.parse_args()

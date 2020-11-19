@@ -115,6 +115,8 @@ def get_sent_info(arg):
     lowercase, replace_num, vocab, action_dict, io_action_dict = setting
     top_down_actions = get_actions(tree)
     in_order_actions = utils.get_in_order_actions(tree)
+    top_down_max_stack_size = utils.get_top_down_max_stack_size(top_down_actions)
+    in_order_max_stack_size = utils.get_in_order_max_stack_size(in_order_actions)
     tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
     orig_tokens = tokens[:]
     assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
@@ -134,8 +136,10 @@ def get_sent_info(arg):
         'tags': tags,
         'actions': top_down_actions,
         'action_ids': top_down_action_ids,
+        'max_stack_size': top_down_max_stack_size,
         'in_order_actions': in_order_actions,
         'in_order_action_ids': in_order_action_ids,
+        'in_order_max_stack_size': in_order_max_stack_size,
         'tree_str': tree
     }
 
@@ -147,7 +151,7 @@ def get_data(args):
         w2c = defaultdict(int)
         with open(textfile, 'r') as f:
             trees = [tree.strip() for tree in f]
-        with Pool() as pool:
+        with Pool(args.jobs) as pool:
             for tags, sent, sent_lower in pool.map(get_tags_tokens_lowercase, trees):
                 assert(len(tags) == len(sent))
                 if lowercase:
@@ -171,12 +175,12 @@ def get_data(args):
             w2c = dict(sorted_wc[:vocabsize])
         return Vocabulary(list(w2c.items()), pad, unkmethod, unk, specials)
 
-    def get_nonterminals(textfiles):
+    def get_nonterminals(textfiles, jobs=-1):
         nts = set()
         for fn in textfiles:
             with open(fn, 'r') as f:
                 lines = [line for line in f]
-            with Pool() as pool:
+            with Pool(jobs) as pool:
                 local_nts = pool.map(find_nts_in_tree, lines)
                 nts.update(list(itertools.chain.from_iterable(local_nts)))
         nts = sorted(list(nts))
@@ -184,13 +188,13 @@ def get_data(args):
         return nts
 
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
-                outfile, vocab, action_dict, io_action_dict, apply_length_filter=True):
+                outfile, vocab, action_dict, io_action_dict, apply_length_filter=True, jobs=-1):
         dropped = 0
         sentences = []
         conv_setting = (lowercase, replace_num, vocab, action_dict, io_action_dict)
         with open(textfile, 'r') as f:
             tree_with_settings = [(tree, conv_setting) for tree in f]
-        with Pool() as pool:
+        with Pool(jobs) as pool:
             for sent_info in pool.map(get_sent_info, tree_with_settings):
                 tokens = sent_info['tokens']
                 if apply_length_filter and (len(tokens) > seqlength or len(tokens) < minseqlength):
@@ -213,7 +217,7 @@ def get_data(args):
         json.dump(f, open(outfile, 'wt'))
 
     print("First pass through data to get nonterminals...")
-    nonterminals = get_nonterminals([args.trainfile, args.valfile])
+    nonterminals = get_nonterminals([args.trainfile, args.valfile], args.jobs)
     action_dict = TopDownActionDict(nonterminals)
     io_action_dict = InOrderActionDict(nonterminals)
 
@@ -230,13 +234,13 @@ def get_data(args):
     print("Vocab size: {}".format(len(vocab.i2w)))
     convert(args.testfile, args.lowercase, args.replace_num,
             0, args.minseqlength, args.outputfile + "-test.json",
-            vocab, action_dict, io_action_dict, 0)
+            vocab, action_dict, io_action_dict, 0, args.jobs)
     convert(args.valfile, args.lowercase, args.replace_num,
             args.seqlength, args.minseqlength, args.outputfile + "-val.json",
-            vocab, action_dict, io_action_dict, 0)
+            vocab, action_dict, io_action_dict, 0, args.jobs)
     convert(args.trainfile, args.lowercase, args.replace_num,
             args.seqlength,  args.minseqlength, args.outputfile + "-train.json",
-            vocab, action_dict, io_action_dict, 1)
+            vocab, action_dict, io_action_dict, 1, args.jobs)
 
 def main(arguments):
     parser = argparse.ArgumentParser(
@@ -256,7 +260,6 @@ def main(arguments):
     parser.add_argument('--trainfile', help="Path to training data.", required=True)
     parser.add_argument('--valfile', help="Path to validation data.", required=True)
     parser.add_argument('--testfile', help="Path to test validation data.", required=True)
-    # parser.add_argument('--batchsize', help="Size of each minibatch.", type=int, default=16)
     parser.add_argument('--seqlength', help="Maximum sequence length. Sequences longer "
                                             "than this are dropped.", type=int, default=300)
     parser.add_argument('--minseqlength', help="Minimum sequence length. Sequences shorter "
@@ -267,10 +270,10 @@ def main(arguments):
                                             "then including this will ignore srcvocabsize and use the"
                                             "vocab provided here.",
                                             type = str, default='')
-    # parser.add_argument('--shuffle', help="If = 1, shuffle sentences before sorting (based on  "
-    #                                        "source length).",
-    #                                        type = int, default = 1)
+    parser.add_argument('--jobs', type=int, default=-1)
     args = parser.parse_args(arguments)
+    if args.jobs == -1:
+        args.jobs = len(os.sched_getaffinity(0))
     # np.random.seed(3435)
     get_data(args)
 

@@ -27,31 +27,42 @@ def get_in_order_actions(line):
   tree = Tree.fromstring(line.strip())
   return get_actions_recur(tree) + ['FINISH']
 
-def get_actions(tree, SHIFT = 0, REDUCE = 1, OPEN='(', CLOSE=')'):
-  #input tree in bracket form: ((A B) (C D))
-  #output action sequence: 0 0 1 0 0 1 1, where 0 is SHIFT and 1 is REDUCE
-  actions = []
-  tree = tree.strip()
-  i = 0
-  num_shift = 0
-  num_reduce = 0
-  left = 0
-  right = 0
-  while i < len(tree):
-    if tree[i] != ' ' and tree[i] != OPEN and tree[i] != CLOSE: #terminal      
-      if tree[i-1] == OPEN or tree[i-1] == ' ':
-        actions.append(SHIFT)
-        num_shift += 1
-    elif tree[i] == CLOSE:
-      actions.append(REDUCE)
-      num_reduce += 1
-      right += 1
-    elif tree[i] == OPEN:
-      left += 1
-    i += 1
-  assert(num_shift == num_reduce + 1)
-  return actions
 
+def get_top_down_max_stack_size(actions):
+  stack = []
+  max_size = 0
+  for a in actions:
+    if a == 'SHIFT':
+      stack.append('w')
+    elif a[:2] == 'NT':
+      stack.append('(')
+    elif a == 'REDUCE':
+      while stack[-1] != '(':
+        stack.pop()
+      stack[-1] = 'w'
+    max_size = max(max_size, len(stack))
+  if len(stack) != 1:
+    print(stack)
+  assert len(stack) == 1
+  return max_size
+
+def get_in_order_max_stack_size(actions):
+  stack = []
+  max_size = 0
+  for a in actions:
+    if a == 'SHIFT':
+      stack.append('w')
+    elif a[:2] == 'NT':
+      lc = stack.pop()
+      stack.append('(')
+      stack.append(lc)
+    elif a == 'REDUCE':
+      while stack[-1] != '(':
+        stack.pop()
+      stack[-1] = 'w'
+    max_size = max(max_size, len(stack))
+  assert len(stack) == 1
+  return max_size
 
 def get_tree(actions, sent = None, SHIFT = 0, REDUCE = 1):
   #input action and sent (lists), e.g. S S R S S R R, A B C D

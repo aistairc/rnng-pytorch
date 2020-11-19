@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import numpy as np
+import math
 import torch
 import pickle
 from collections import defaultdict
@@ -108,7 +109,8 @@ class Vocabulary(object):
 
 class Sentence(object):
   def __init__(self, orig_tokens, tokens, token_ids, tags,
-               actions=None, action_ids=None, tree_str=None):
+               actions=None, action_ids=None, tree_str=None,
+               max_stack_size=-1):
     self.orig_tokens = orig_tokens
     self.tokens = tokens
     self.token_ids = token_ids
@@ -116,6 +118,7 @@ class Sentence(object):
     self.actions = actions or []
     self.action_ids = action_ids or []
     self.tree_str = tree_str  # original annotation
+    self.max_stack_size = max_stack_size
 
   @staticmethod
   def from_json(j, oracle='top_down'):
@@ -131,7 +134,8 @@ class Sentence(object):
                     j.get('tags', []),
                     actions,
                     action_ids,
-                    j.get('tree_str', None))
+                    j.get('tree_str', None),
+                    j.get('max_stack_size', -1))
 
   def random_unked(self, vocab):
     def unkify_rand(w_id):
@@ -146,11 +150,11 @@ class Sentence(object):
     return {'orig_tokens': self.orig_tokens, 'tokens': self.tokens,
             'token_ids': self.token_ids,'tags': self.tags,
             'actions': self.actions, 'action_ids': self.action_ids,
-            'tree_str': self.tree_str}
+            'tree_str': self.tree_str, 'max_stack_size': self.max_stack_size}
 
 class Dataset(object):
   def __init__(self, sents, batch_size, vocab, action_dict, random_unk=False, prepro_args={},
-               batch_token_size = 10000000):
+               batch_token_size = 15000, batch_group='same_length'):
     self.sents = sents
     self.batch_size = batch_size
     self.batch_token_size = batch_token_size  # This bounds the batch size by the number of tokens.
@@ -160,12 +164,17 @@ class Dataset(object):
     self.prepro_args = prepro_args  # keeps which process is performed.
 
     self.vocab_size = vocab.size()
-    self.len_to_idxs = self._get_len_to_idxs()
+    if batch_group == 'same_length':
+      self.len_to_idxs = self._get_len_to_idxs()
+    elif batch_group == 'similar_length':
+      self.len_to_idxs = self._get_grouped_len_to_idxs()
+    elif batch_group == 'random':
+      self.len_to_idxs = self._get_random_len_to_idxs()
     self.num_batches = self.get_num_batches()
 
   @staticmethod
   def from_json(data_file, batch_size, vocab=None, action_dict=None, random_unk=False,
-                oracle='top_down'):
+                oracle='top_down', batch_group='same_length', batch_token_size=15000):
     """If vocab and action_dict are provided, they are not loaded from data_file.
     This is for sharing these across train/valid/test sents.
 
@@ -184,11 +193,12 @@ class Dataset(object):
     vocab = vocab or Vocabulary.from_data_json(j)
     action_dict = action_dict or new_action_dict(j['nonterminals'])
 
-    return Dataset(sents, batch_size, vocab, action_dict, random_unk, j['args'])
+    return Dataset(sents, batch_size, vocab, action_dict, random_unk, j['args'],
+                   batch_group=batch_group, batch_token_size=batch_token_size)
 
   @staticmethod
   def from_text_file(text_file, batch_size, vocab, action_dict, tagger_fn = None,
-                     prepro_args = {}, batch_token_size = 10000000):
+                     prepro_args = {}, batch_token_size = 15000, batch_group = 'same_length'):
     """tagger_fn is a function receiving a sentence and returning POS tags.
     If Not provided, dummy tags (X) are provided.
     """
@@ -206,7 +216,8 @@ class Dataset(object):
         tags = tagger_fn(tokens)
         sent = Sentence(orig_tokens, tokens, token_ids, tags)
         sents.append(sent)
-    return Dataset(sents, batch_size, vocab, action_dict, False, prepro_args, batch_token_size)
+    return Dataset(sents, batch_size, vocab, action_dict, False, prepro_args, batch_token_size,
+                   batch_group=batch_group)
 
   def get_num_batches(self):
     b = 0
@@ -260,10 +271,27 @@ class Dataset(object):
     for length, idxs in len_to_idxs.items():
       if shuffle:
         idxs = np.random.permutation(idxs)
-      batch_size_by_token = self.batch_token_size // length
-      batch_size = max(min(self.batch_size, batch_size_by_token), 1)
-      for begin in range(0, len(idxs), batch_size):
-        batches.append(idxs[begin:begin+batch_size])
+
+      def add_batch(begin, end):
+        assert begin < end
+        batches.append(idxs[begin:end])
+
+      longest_sent_len = 0
+      batch_i = 0
+      b = 0
+      # Create each batch to guarantee that (batch_size*max_sent_len) does not exceed
+      # self.batch_token_size.
+      for i in range(len(idxs)):
+        cur_tokens = len(self.sents[idxs[i]].token_ids)
+        longest_sent_len = max(longest_sent_len, cur_tokens)
+        if ((longest_sent_len * (batch_i+1) >= self.batch_token_size) or
+            (batch_i > 0 and batch_i % self.batch_size == 0)):
+          add_batch(b, i)
+          batch_i = 0  # i is not included in prev batch
+          longest_sent_len = cur_tokens
+          b = i
+        batch_i += 1
+      add_batch(b, i+1)
     if shuffle:
         batches = np.random.permutation(batches)
 
@@ -276,25 +304,74 @@ class Dataset(object):
 
     for batch_idx in batches:
       token_ids = [conv_sent(i) for i in batch_idx]
-      ret = (torch.tensor(token_ids, dtype=torch.long),)
+      ret = (torch.tensor(self._pad_token_ids(token_ids), dtype=torch.long),)
       if not test:
         action_ids = [self.sents[i].action_ids for i in batch_idx]
-        ret += (torch.tensor(self._pad_action_ids(action_ids), dtype=torch.long),)
+        max_stack_size = max([self.sents[i].max_stack_size for i in batch_idx])
+        ret += (torch.tensor(self._pad_action_ids(action_ids), dtype=torch.long),
+                max_stack_size)
       ret += (batch_idx,)
       yield ret
 
   def _get_len_to_idxs(self, sent_idxs = []):
+    def to_len(token_ids):
+      return len(token_ids)
+    return self._get_len_to_idxs_helper(to_len, sent_idxs)
+
+  def _get_grouped_len_to_idxs(self, sent_idxs = []):
+    if len(sent_idxs) == 0:
+      sent_idxs = range(len(self.sents))
+    len_to_idxs = defaultdict(list)
+    group_size = 1024
+    max_length_diff_in_group = 20
+    sent_idxs_with_len = sorted([(i, len(self.sents[i].token_ids)) for i in sent_idxs], key=lambda x:x[1])
+    b = 0
+    last_idx = 0
+    while b < len(sent_idxs_with_len):
+      min_len = sent_idxs_with_len[b][1]
+      max_len = sent_idxs_with_len[min(b+group_size, len(sent_idxs_with_len)-1)][1]
+      if max_len - min_len < max_length_diff_in_group: # small difference in a group -> regist as a group
+        group = [i for i, l in sent_idxs_with_len[b:b+group_size]]
+        b += group_size
+      else:
+        e = b + 1
+        while (e < len(sent_idxs_with_len) and
+               sent_idxs_with_len[e][1] - min_len < max_length_diff_in_group):
+          e += 1
+        group = [i for i, l in sent_idxs_with_len[b:e]]
+        b = e
+      len_to_idxs[len(self.sents[group[-1]].token_ids)] += group
+    # for b in range(0, len(sent_idxs_with_len), group_size):
+    #   group = [i for i, l in sent_idxs_with_len[b:b+group_size]]
+    #   # print(sent_idxs_with_len[b][1], sent_idxs_with_len[min(b+group_size,len(sent_idxs_with_len)-1)][1])
+    #   len_to_idxs[len(self.sents[group[-1]].token_ids)] += group
+    return len_to_idxs
+
+    # def to_len(token_ids):
+    #   return math.ceil(len(token_ids) / 10) * 10
+    # return self._get_len_to_idxs_helper(to_len, sent_idxs)
+
+  def _get_random_len_to_idxs(self, sent_idxs = []):
+    def to_len(token_ids):
+      return 1  # all sentences belong to the same group
+    return self._get_len_to_idxs_helper(to_len, sent_idxs)
+
+  def _get_len_to_idxs_helper(self, calc_len, sent_idxs = []):
     if len(sent_idxs) == 0:
       sent_idxs = range(len(self.sents))
     len_to_idxs = defaultdict(list)
     for i in sent_idxs:
       sent = self.sents[i]
-      len_to_idxs[len(sent.token_ids)].append(i)
+      len_to_idxs[calc_len(sent.token_ids)].append(i)
     return len_to_idxs
 
   def _pad_action_ids(self, action_ids):
     action_ids, _ = pad_items(action_ids, self.action_dict.padding_idx)
     return action_ids
+
+  def _pad_token_ids(self, token_ids):
+    token_ids, _ = pad_items(token_ids, self.vocab.padding_idx)
+    return token_ids
 
   def __len__(self):
     return self.num_batches

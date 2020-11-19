@@ -36,20 +36,24 @@ parser.add_argument('--val_file', default='data/ptb-no-unk-val.json')
 parser.add_argument('--train_from', default='')
 # Model options
 parser.add_argument('--fixed_stack', action='store_true')
+# parser.add_argument('--stack_size_bound', type=int, default=-1, help='If >0, stack size is bounded by this size. Training fails if some sentence requires larger stack sizes.')
 parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
 parser.add_argument('--w_dim', default=256, type=int, help='input/output word dimension')
 parser.add_argument('--h_dim', default=256, type=int, help='LSTM hidden dimension')
 parser.add_argument('--num_layers', default=2, type=int, help='number of layers in LM and the stack LSTM (for RNNG)')
-parser.add_argument('--dropout', default=0.5, type=float, help='dropout rate')
+parser.add_argument('--dropout', default=0.3, type=float, help='dropout rate')
 parser.add_argument('--composition', default='lstm', choices=['lstm', 'attention'],
                     help='lstm: original lstm composition; attention: gated attention introduced in Kuncoro et al. (2017).')
 parser.add_argument('--not_swap_in_order_stack', action='store_true',
                     help=('If True, prevent swapping elements by an open action for the in-order system.'
                           'WARNING: when --fixed_stack is True, this option is automatically and always set to True (obsolete option and no need to care)'))
 # Optimization options
+parser.add_argument('--batch_group', choices=['same_length', 'random', 'similar_length'],
+                    default='similar_length', help='Sentences are grouped by this criterion to make each batch.')
 parser.add_argument('--optimizer', choices=['sgd', 'adam'], help='Which optimizer to use.')
 parser.add_argument('--random_unk', action='store_true', help='Randomly replace a token to <unk> on training sentences by a probability inversely proportional to word frequency.')
 parser.add_argument('--batch_size', type=int, default=16)
+parser.add_argument('--batch_token_size', type=int, default=15000, help='Number of tokens in a batch (batch_size*sentence_length) does not exceed this.')
 parser.add_argument('--save_path', default='rnng.pt', help='where to save the best model')
 parser.add_argument('--num_epochs', default=18, type=int, help='number of training epochs')
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
@@ -74,16 +78,20 @@ class TensorBoardLogger(object):
       log_dir = os.path.join(args.tensorboard_log_dir, args.save_path)
       self.writer = SummaryWriter(log_dir = log_dir)
       self.global_step = 0
+      self.start_time = time.time()
     else:
       self.writer = None
 
-  def write(self, kvs = {}, step = None):
+  def write(self, kvs = {}, step = None, use_time=False):
     if self.writer is not None:
-      if step is None:
-        step = self.global_step
-        self.global_step += 1
+      if use_time:
+        step = (time.time() - self.start_time)
+      else:
+        if step is None:
+          step = self.global_step
+          self.global_step += 1
       for k, v in kvs.items():
-        self.writer.add_scalar(k, v, step)
+        self.writer.add_scalar(k, v, global_step=step)
 
 def create_model(args, action_dict, vocab):
   model_args = {'action_dict': action_dict,
@@ -113,12 +121,12 @@ def create_model(args, action_dict, vocab):
 
 def main(args):
   logger.info('Args: {}'.format(args))
-  tb = TensorBoardLogger(args)
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
   torch.cuda.manual_seed(args.seed)
   train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=args.random_unk,
-                                 oracle=args.strategy)
+                                 oracle=args.strategy, batch_group=args.batch_group,
+                                 batch_token_size=args.batch_token_size)
   vocab = train_data.vocab
   action_dict = train_data.action_dict
   val_data = Dataset.from_json(args.val_file, args.batch_size, vocab, action_dict,
@@ -154,6 +162,7 @@ def main(args):
     scaler = torch.cuda.amp.GradScaler()
 
   global_batch_i = 0
+  tb = TensorBoardLogger(args)
   while epoch < args.num_epochs:
     start_time = time.time()
     epoch += 1
@@ -165,8 +174,28 @@ def main(args):
     total_a_ll = 0.
     total_w_ll = 0.
     prev_ll = 0.
+
+    def output_learn_log():
+      param_norm = sum([p.norm()**2 for p in model.parameters()]).item()**0.5
+      total_ll = total_a_ll + total_w_ll
+      ppl = np.exp((-total_a_ll - total_w_ll) / (num_actions + num_words))
+      ll_diff =  total_ll - prev_ll
+      action_ppl = np.exp(-total_a_ll / num_actions)
+      word_ppl = np.exp(-total_w_ll / num_words)
+      logger.info('Epoch: {}, Batch: {}/{}, LR: {:.4f}, '
+                  'ActionPPL: {:.2f}, WordPPL: {:.2f}, '
+                  'PPL: {:2f}, LL: {}, '
+                  '|Param|: {:.2f}, Throughput: {:.2f} examples/sec'.format(
+                    epoch, b, len(train_data), args.lr,
+                    action_ppl, word_ppl,
+                    ppl, -ll_diff,
+                    param_norm, num_sents / (time.time() - start_time)
+                  ))
+      return ppl, word_ppl, action_ppl
+
     for batch in train_data.batches():
-      token_ids, action_ids, batch_idx = batch
+      token_ids, action_ids, max_stack_size, batch_idx = batch
+      # print(max_stack_size, token_ids.size())
       token_ids = token_ids.cuda()
       action_ids = action_ids.cuda()
       b += 1
@@ -174,7 +203,7 @@ def main(args):
       optimizer.zero_grad()
 
       def calc_loss():
-        loss, a_loss, w_loss, _ = model(token_ids, action_ids)
+        loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
         if args.loss_normalize == 'sum':
           loss = loss
         elif args.loss_normalize == 'batch':
@@ -210,27 +239,14 @@ def main(args):
       continuous_epoch = int(((epoch-1) + (b / len(train_data))) * 10000)
 
       if b % args.print_every == 0:
-        param_norm = sum([p.norm()**2 for p in model.parameters()]).item()**0.5
-        total_ll = total_a_ll + total_w_ll
-        ppl = np.exp((-total_a_ll - total_w_ll) / (num_actions + num_words))
-        ll_diff =  total_ll - prev_ll
-        prev_ll = total_ll
-        action_ppl = np.exp(-total_a_ll / num_actions)
-        word_ppl = np.exp(-total_w_ll / num_words)
-        logger.info('Epoch: {}, Batch: {}/{}, LR: {:.4f}, '
-                    'ActionPPL: {:.2f}, WordPPL: {:.2f}, '
-                    'PPL: {:2f}, LL: {}, '
-                    '|Param|: {:.2f}, Throughput: {:.2f} examples/sec'.format(
-                      epoch, b, len(train_data), args.lr,
-                      action_ppl, word_ppl,
-                      ppl, -ll_diff,
-                      param_norm, num_sents / (time.time() - start_time)
-                    ))
+        ppl, word_ppl, _ = output_learn_log()
+        prev_ll = total_a_ll + total_w_ll
         tb.write({'Train ppl': ppl, 'Train word ppl': word_ppl, 'lr': args.lr}, continuous_epoch)
 
       if args.valid_every > 0 and global_batch_i % args.valid_every == 0:
         do_valid(model, optimizer, train_data, val_data, tb, epoch, continuous_epoch, val_losses, args)
 
+    output_learn_log()
     if args.valid_every <= 0:
       do_valid(model, optimizer, train_data, val_data, tb, epoch, epoch, val_losses, args)
 
@@ -245,6 +261,7 @@ def do_valid(model, optimizer, train_data, val_data, tb, epoch, step, val_losses
   logger.info('Checking validation perplexity...')
   val_loss, val_ppl, val_action_ppl, val_word_ppl = eval_action_ppl(val_data, model)
   tb.write({'Valid ppl': val_ppl, 'Valid action ppl': val_action_ppl, 'Valid word ppl': val_word_ppl}, step)
+  tb.write({'Valid loss': val_loss}, use_time=True)
   logger.info('--------------------------------')
   if val_loss < best_val_loss:
     best_val_loss = val_loss
@@ -278,10 +295,10 @@ def eval_action_ppl(data, model):
   total_w_ll = 0
   with torch.no_grad():
     for batch in data.batches():
-      token_ids, action_ids, batch_idx = batch
+      token_ids, action_ids, max_stack_size, batch_idx = batch
       token_ids = token_ids.cuda()
       action_ids = action_ids.cuda()
-      loss, a_loss, w_loss, _ = model(token_ids, action_ids)
+      loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
       total_a_ll += -a_loss.sum().detach().item()
       total_w_ll += -w_loss.sum().detach().item()
 

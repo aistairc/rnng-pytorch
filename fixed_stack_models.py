@@ -18,7 +18,7 @@ class MultiLayerLSTMCell(nn.Module):
       self.lstm.append(nn.LSTMCell(hidden_size, hidden_size))
     self.num_layers = num_layers
     self.dropout = dropout
-    self.dropout_layer = nn.Dropout(dropout)
+    self.dropout_layer = nn.Dropout(dropout, inplace=True)
 
   def forward(self, input, prev):
     """
@@ -57,7 +57,7 @@ class LSTMComposition(nn.Module):
     super(LSTMComposition, self).__init__()
     self.dim = dim
     self.rnn = nn.LSTM(dim, dim, bidirectional=True, batch_first=True)
-    self.output = nn.Sequential(nn.Dropout(dropout), nn.Linear(dim*2, dim), nn.ReLU())
+    self.output = nn.Sequential(nn.Dropout(dropout, inplace=True), nn.Linear(dim*2, dim), nn.ReLU())
 
     self.batch_index = torch.arange(0, 10000, dtype=torch.long)  # cache with sufficient number.
 
@@ -91,7 +91,7 @@ class AttentionComposition(nn.Module):
     super(AttentionComposition, self).__init__()
     self.w_dim = w_dim
     self.num_labels = num_labels
-    self.dropout = nn.Dropout(dropout)
+    self.dropout = nn.Dropout(dropout, inplace=True)
 
     self.rnn = nn.LSTM(w_dim, w_dim, bidirectional=True, batch_first=True)
 
@@ -556,7 +556,7 @@ class RNNGCell(nn.Module):
     self.input_size = input_size
     self.hidden_size = hidden_size
     self.num_layers = num_layers
-    self.dropout = nn.Dropout(dropout)
+    self.dropout = nn.Dropout(dropout, inplace=True)
 
     self.nt_emb = nn.Sequential(nn.Embedding(action_dict.num_nts(), input_size), self.dropout)
     self.stack_rnn = MultiLayerLSTMCell(input_size, hidden_size, num_layers, dropout=dropout)
@@ -641,7 +641,7 @@ class FixedStackRNNG(nn.Module):
     self.word_criterion = nn.CrossEntropyLoss(reduction='none',
                                               ignore_index=padding_idx)
 
-    self.dropout = nn.Dropout(dropout)
+    self.dropout = nn.Dropout(dropout, inplace=True)
     self.emb = nn.Sequential(
       nn.Embedding(vocab, w_dim, padding_idx=padding_idx), self.dropout)
 
@@ -658,11 +658,15 @@ class FixedStackRNNG(nn.Module):
     self.max_open_nts = max_open_nts
     self.max_cons_nts = max_cons_nts
 
-  def forward(self, x, actions, initial_stack = None):
+  def forward(self, x, actions, initial_stack = None, stack_size_bound = -1):
     assert isinstance(x, torch.Tensor)
     assert isinstance(actions, torch.Tensor)
 
-    stack = self.build_stack(x)
+    if stack_size_bound <= 0:
+      stack_size = max(100, x.size(1) + 10)
+    else:
+      stack_size = stack_size_bound
+    stack = self.build_stack(x, stack_size)
     word_vecs = self.emb(x)
     action_contexts = self.unroll_states(stack, word_vecs, actions)
 
@@ -680,8 +684,7 @@ class FixedStackRNNG(nn.Module):
     hs = self.rnng.output(hs.transpose(1, 0).contiguous())  # (batch_size, action_len, input_size)
     return hs
 
-  def build_stack(self, x):
-    stack_size = max(150, x.size(1) + 100)
+  def build_stack(self, x, stack_size = 80):
     initial_hidden = self.rnng.get_initial_hidden(x)
     return FixedStack(initial_hidden, stack_size, self.input_size)
 
@@ -691,7 +694,7 @@ class FixedStackRNNG(nn.Module):
     hiddens = hiddens.view(actions.size(0), -1)
 
     action_mask = actions != action_dict.padding_idx
-    idx = action_mask.nonzero().squeeze(1)
+    idx = action_mask.nonzero(as_tuple=False).squeeze(1)
     actions = actions[idx]
     hiddens = hiddens[idx]
 
@@ -705,10 +708,11 @@ class FixedStackRNNG(nn.Module):
     hiddens = hiddens.view(actions.size(0), -1)
 
     action_mask = actions == action_dict.a2i['SHIFT']
-    idx = action_mask.nonzero().squeeze(1)
+    idx = action_mask.nonzero(as_tuple=False).squeeze(1)
     hiddens = hiddens[idx]
 
     x = x.view(-1)
+    x = x[x != self.padding_idx]
     assert x.size(0) == hiddens.size(0)
     logit = self.vocab_mlp(hiddens)
     loss = self.word_criterion(logit, x)
@@ -840,7 +844,8 @@ class FixedStackRNNG(nn.Module):
     if stack_size_bound <= 0:
       stack_size = max(100, x.size(1) + 10)
     else:
-      stack_size = min(int(x.size(1)*2.5), bounded_stack_size)
+      #stack_size = min(int(x.size(1)*2.5), stack_size_bound)
+      stack_size = min(x.size(1) + 20, stack_size_bound)
     stack_size = math.ceil(stack_size / 8) * 8  # force to be multiple of 8.
     initial_hidden = self.rnng.get_initial_hidden(x)
     stack_unfinished, state_unfinished = self.new_beam_stack_with_state(
