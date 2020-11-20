@@ -36,7 +36,6 @@ parser.add_argument('--val_file', default='data/ptb-no-unk-val.json')
 parser.add_argument('--train_from', default='')
 # Model options
 parser.add_argument('--fixed_stack', action='store_true')
-# parser.add_argument('--stack_size_bound', type=int, default=-1, help='If >0, stack size is bounded by this size. Training fails if some sentence requires larger stack sizes.')
 parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
 parser.add_argument('--w_dim', default=256, type=int, help='input/output word dimension')
 parser.add_argument('--h_dim', default=256, type=int, help='LSTM hidden dimension')
@@ -58,7 +57,6 @@ parser.add_argument('--save_path', default='rnng.pt', help='where to save the be
 parser.add_argument('--num_epochs', default=18, type=int, help='number of training epochs')
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
 parser.add_argument('--decay_cond_epochs', default=1, type=int, help='decay learning rate if loss does not improve conscutively this many steps')
-#parser.add_argument('--mode', default='unsupervised', type=str, choices=['unsupervised', 'supervised'])
 parser.add_argument('--lr', default=0.001, type=float, help='starting learning rate')
 parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action'])
 parser.add_argument('--decay', default=0.5, type=float, help='')
@@ -93,7 +91,19 @@ class TensorBoardLogger(object):
       for k, v in kvs.items():
         self.writer.add_scalar(k, v, global_step=step)
 
+def create_optimizer(args, model):
+  if args.optimizer == 'sgd':
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+  else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    args.min_epochs = args.num_epochs
+  return optimizer
+
 def create_model(args, action_dict, vocab):
+  if isinstance(args, dict):
+    # Args is saved as a dict so we need to convert to Namespace when loading from a checkpoint.
+    from argparse import Namespace
+    args = Namespace(**args)
   model_args = {'action_dict': action_dict,
                 'vocab': vocab.size(),
                 'padding_idx': vocab.padding_idx,
@@ -139,17 +149,16 @@ def main(args):
   cuda.set_device(args.gpu)
   if args.train_from == '':
     model = create_model(args, action_dict, vocab)
+    optimizer = create_optimizer(args, model)
   else:
     logger.info('loading model from ' + args.train_from)
     checkpoint = torch.load(args.train_from)
-    model = checkpoint['model']
+    model = create_model(checkpoint['args'], action_dict, vocab)
+    model = model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer = create_optimizer(args, model)
+    optimizer = optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
   logger.info("model architecture")
   logger.info(model)
-  if args.optimizer == 'sgd':
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
-  else:
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    args.min_epochs = args.num_epochs
   model.train()
   model.cuda()
 
@@ -195,7 +204,6 @@ def main(args):
 
     for batch in train_data.batches():
       token_ids, action_ids, max_stack_size, batch_idx = batch
-      # print(max_stack_size, token_ids.size())
       token_ids = token_ids.cuda()
       action_ids = action_ids.cuda()
       b += 1
@@ -215,10 +223,10 @@ def main(args):
       if args.amp:
         with torch.cuda.amp.autocast():
           loss, a_loss, w_loss = calc_loss()
-          scaler.scale(loss).backward()
+        scaler.scale(loss).backward()
         if args.max_grad_norm > 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+          scaler.unscale_(optimizer)
+          torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
       else:
@@ -263,14 +271,16 @@ def do_valid(model, optimizer, train_data, val_data, tb, epoch, step, val_losses
   tb.write({'Valid ppl': val_ppl, 'Valid action ppl': val_action_ppl, 'Valid word ppl': val_word_ppl}, step)
   tb.write({'Valid loss': val_loss}, use_time=True)
   logger.info('--------------------------------')
+  # from apex import amp
   if val_loss < best_val_loss:
     best_val_loss = val_loss
     checkpoint = {
       'args': args.__dict__,
-      'model': model.cpu(),
+      'model_state_dict': model.state_dict(),
+      'optimizer_state_dict': optimizer.state_dict(),
       'vocab': train_data.vocab,
       'prepro_args': train_data.prepro_args,
-      'action_dict': train_data.action_dict
+      'action_dict': train_data.action_dict,
     }
     logger.info('Saving checkpoint to {}'.format(args.save_path))
     torch.save(checkpoint, args.save_path)

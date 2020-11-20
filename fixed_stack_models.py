@@ -126,7 +126,7 @@ class AttentionComposition(nn.Module):
 
 
 class FixedStack:
-  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
+  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1, tree_dtype = torch.float32):
     super(FixedStack, self).__init__()
     device = initial_hidden[1].device
     hidden_size = initial_hidden[0].size(-2)
@@ -148,17 +148,17 @@ class FixedStack:
 
     self.pointer = torch.zeros(batch_size, dtype=torch.long, device=device)  # word pointer
     self.top_position = torch.zeros(batch_size, dtype=torch.long, device=device)  # stack top position
-    self.hiddens = torch.zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
-    self.cells = torch.zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
-    self.trees = torch.zeros(batch_size + (stack_size, input_size), device=device)
+    self.hiddens = initial_hidden[0].new_zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
+    self.cells = initial_hidden[0].new_zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
+    self.trees = torch.zeros(batch_size + (stack_size, input_size), device=device, dtype=tree_dtype)
 
     if beam_size == 1:
-      self.hiddens[:, 0] = initial_hidden[0].float()
-      self.cells[:, 0] = initial_hidden[1].float()
+      self.hiddens[:, 0] = initial_hidden[0]
+      self.cells[:, 0] = initial_hidden[1]
     else:
       # Only fill zero-th beam position because we do not have other beam elems at beginning of search.
-      self.hiddens[:, 0, 0] = initial_hidden[0].float()
-      self.cells[:, 0, 0] = initial_hidden[1].float()
+      self.hiddens[:, 0, 0] = initial_hidden[0]
+      self.cells[:, 0, 0] = initial_hidden[1]
 
     self.nt_index = torch.zeros(batch_size + (stack_size,), dtype=torch.long, device=device)
     self.nt_ids = torch.zeros(batch_size + (stack_size,), dtype=torch.long, device=device)
@@ -193,7 +193,7 @@ class FixedStack:
 
   def do_reduce(self, reduce_batches, new_child):
     prev_nt_position = self.nt_index[reduce_batches + (self.nt_index_pos[reduce_batches],)]
-    self.trees[reduce_batches + (prev_nt_position-1,)] = new_child.float()
+    self.trees[reduce_batches + (prev_nt_position-1,)] = new_child.to(self.trees.dtype)
     self.nt_index_pos[reduce_batches] = self.nt_index_pos[reduce_batches] - 1
     self.top_position[reduce_batches] = prev_nt_position
 
@@ -217,8 +217,8 @@ class FixedStack:
 
   def update_hidden(self, new_hidden, new_cell):
     pos = self.top_position.reshape(-1).clone()
-    self.hiddens[self.batch_index + (pos,)] = new_hidden.float()
-    self.cells[self.batch_index + (pos,)] = new_cell.float()
+    self.hiddens[self.batch_index + (pos,)] = new_hidden
+    self.cells[self.batch_index + (pos,)] = new_cell
 
   def sort_by(self, sort_idx):
     """
@@ -585,7 +585,7 @@ class RNNGCell(nn.Module):
     nt_batches = (actions >= self.action_dict.nt_begin_id()).nonzero(as_tuple=True)
     shift_batches = (actions == self.action_dict.a2i['SHIFT']).nonzero(as_tuple=True)
 
-    new_input = word_vecs.new_zeros(stack.hiddens.size()[:-3] + (self.input_size,))
+    new_input = stack.trees.new_zeros(stack.hiddens.size()[:-3] + (self.input_size,))
 
     # First fill in trees. Then, gather those added elements in a column, which become
     # the input to stack_rnn.
@@ -610,7 +610,7 @@ class RNNGCell(nn.Module):
         stack_h = None
       new_child, _, _ = self.composition(children, ch_lengths, reduced_nt, reduced_nt_ids, stack_h)
       stack.do_reduce(reduce_batches, new_child)
-      new_input[reduce_batches] = new_child.float()
+      new_input[reduce_batches] = new_child.to(new_input.dtype)
 
     # Input for rnn should be (beam_size, input_size). During beam search, new_input has different size.
     new_hidden, new_cell = self.stack_rnn(new_input.view(-1, self.input_size),
@@ -686,7 +686,8 @@ class FixedStackRNNG(nn.Module):
 
   def build_stack(self, x, stack_size = 80):
     initial_hidden = self.rnng.get_initial_hidden(x)
-    return FixedStack(initial_hidden, stack_size, self.input_size)
+    return FixedStack(initial_hidden, stack_size, self.input_size,
+                      tree_dtype=self.emb[0].weight.dtype)
 
   def action_loss(self, actions, action_dict, hiddens):
     assert hiddens.size()[:2] == actions.size()
@@ -862,7 +863,8 @@ class FixedStackRNNG(nn.Module):
                       True, particle, K))
 
   def new_beam_stack_with_state(self, initial_hidden, stack_size, beam_size):
-    stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
+    stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size,
+                       tree_dtype=self.emb[0].weight.dtype)
     stack_state = StackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
 
@@ -1019,7 +1021,8 @@ class FixedStackRNNG(nn.Module):
     :param next_x: (batch_size) to be shifted token ids
     """
     hiddens = self.rnng.output(stack.hidden_head()[:, :, -1])  # (beam*batch, hidden_size)
-    action_logit = self.action_mlp(hiddens).view(invalid_action_mask.size())  # (beam, batch, num_actions)
+    # fp16 is cancelled here before softmax (I want to keep precision in final probablities).
+    action_logit = self.action_mlp(hiddens).view(invalid_action_mask.size()).float()  # (beam, batch, num_actions)
     action_logit[invalid_action_mask] = -float('inf')
 
     log_probs = F.log_softmax(action_logit, -1)  # (batch_size, beam_size, num_actions)
@@ -1028,7 +1031,7 @@ class FixedStackRNNG(nn.Module):
       disc_log_probs = log_probs.clone()
 
     if next_x is not None:  # shift is valid for next action
-      word_logit = self.vocab_mlp(hiddens)  # (batch*beam, vocab_size)
+      word_logit = self.vocab_mlp(hiddens).float()  # (batch*beam, vocab_size)
       shift_idx = self.action_dict.a2i['SHIFT']
       next_x = next_x.unsqueeze(1).expand(-1, log_probs.size(1)).clone().view(-1)  # (batch*beam)
       word_log_probs = self.word_criterion(word_logit, next_x) * -1.0  # (batch_size*beam_size, vocab_size)

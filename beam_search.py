@@ -6,6 +6,7 @@ import json
 import random
 import shutil
 import copy
+from collections import OrderedDict
 
 import torch
 from torch import cuda
@@ -50,16 +51,28 @@ parser.add_argument('--dump_beam', action='store_true',
                     help='(For debug and model development) print out all states in the beam at each step')
 parser.add_argument('--gpu', default=0, type=int, help='which gpu to use')
 parser.add_argument('--seed', default=3435, type=int)
-parser.add_argument('--amp', action='store_true')
+parser.add_argument('--fp16', action='store_true')
+
+def load_model(checkpoint, action_dict, vocab):
+  if 'model_state_dict' in checkpoint:
+    from train import create_model
+    model = create_model(checkpoint['args'], action_dict, vocab)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    return model
+  else:
+    return checkpoint['model']
 
 def main(args):
   np.random.seed(args.seed)
   torch.manual_seed(args.seed)
   checkpoint = torch.load(args.model_file)
-  model = checkpoint['model']
   vocab = checkpoint['vocab']
   action_dict = checkpoint['action_dict']
   prepro_args = checkpoint['prepro_args']
+  model = load_model(checkpoint, action_dict, vocab)
+
+  if args.fp16:
+    model.half()
 
   # todo: add tagger.
   dataset = Dataset.from_text_file(args.test_file, args.batch_size, vocab, action_dict,
@@ -127,12 +140,11 @@ def main(args):
     for batch in tqdm(batches):
       tokens, batch_idx = batch
       tokens = tokens.cuda()
-      with torch.cuda.amp.autocast(enabled=args.amp):
-        if args.dump_beam:
-          parses, surprisals, beam_history = parse(model, tokens, True)
-          dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
-        else:
-          parses, surprisals = parse(model, tokens, False)
+      if args.dump_beam:
+        parses, surprisals, beam_history = parse(model, tokens, True)
+        dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
+      else:
+        parses, surprisals = parse(model, tokens, False)
 
       best_actions = [p[0][0] for p in parses]  # p[0][1] is likelihood
       trees = [action_dict.build_tree_str(best_actions[i],
