@@ -242,41 +242,104 @@ def pad_items(items, pad_id):
   return items, lengths
 
 def berkeley_unk_conv(ws):
+  """This is a simplified version of unknown token conversion in BerkeleyParser.
+
+  The full version is berkely_unk_conv2.
+  """
   uk = "unk"
   sz = len(ws) - 1
   if ws[0].isupper():
-      uk = "c" + uk
+    uk = "c" + uk
   if ws[0].isdigit() and ws[sz].isdigit():
-      uk = uk + "n"
+    uk = uk + "n"
   elif sz <= 2:
-      pass
+    pass
   elif ws[sz-2:sz+1] == "ing":
-      uk = uk + "ing"
+    uk = uk + "ing"
   elif ws[sz-1:sz+1] == "ed":
-      uk = uk + "ed"
+    uk = uk + "ed"
   elif ws[sz-1:sz+1] == "ly":
-      uk = uk + "ly"
+    uk = uk + "ly"
   elif ws[sz] == "s":
-      uk = uk + "s"
+    uk = uk + "s"
   elif ws[sz-2:sz+1] == "est":
-      uk = uk + "est"
+    uk = uk + "est"
   elif ws[sz-1:sz+1] == "er":
-      uk = uk + 'ER'
+    uk = uk + 'ER'
   elif ws[sz-2:sz+1] == "ion":
-      uk = uk + "ion"
+    uk = uk + "ion"
   elif ws[sz-2:sz+1] == "ory":
-      uk = uk + "ory"
+    uk = uk + "ory"
   elif ws[0:2] == "un":
-      uk = "un" + uk
+    uk = "un" + uk
   elif ws[sz-1:sz+1] == "al":
-      uk = uk + "al"
+    uk = uk + "al"
   else:
-      for i in range(sz):
-          if ws[i] == '-':
-              uk = uk + "-"
-              break
-          elif ws[i] == '.':
-              uk = uk + "."
-              break
+    for i in range(sz):
+      if ws[i] == '-':
+        uk = uk + "-"
+        break
+      elif ws[i] == '.':
+        uk = uk + "."
+        break
   return "<" + uk + ">"
+
+def berkeley_unk_conv2(token):
+  numCaps = 0
+  hasDigit = False
+  hasDash = False
+  hasLower = False
+  for char in token:
+    if char.isdigit():
+      hasDigit = True
+    elif char == '-':
+      hasDash = True
+    elif char.isalpha():
+      if char.islower():
+        hasLower = True
+      elif char.isupper():
+        numCaps += 1
+  result = 'UNK'
+  lower = token.rstrip().lower()
+  ch0 = token.rstrip()[0]
+  if ch0.isupper():
+    if numCaps == 1:
+      result = result + '-INITC'
+      # Remove this because it relies on a vocabulary, not given to this funciton (HN).
+      # if lower in words_dict:
+      #   result = result + '-KNOWNLC'
+    else:
+      result = result + '-CAPS'
+  elif not(ch0.isalpha()) and numCaps > 0:
+    result = result + '-CAPS'
+  elif hasLower:
+    result = result + '-LC'
+  if hasDigit:
+    result = result + '-NUM'
+  if hasDash:
+    result = result + '-DASH'
+  if lower[-1] == 's' and len(lower) >= 3:
+    ch2 = lower[-2]
+    if not(ch2 == 's') and not(ch2 == 'i') and not(ch2 == 'u'):
+      result = result + '-s'
+  elif len(lower) >= 5 and not(hasDash) and not(hasDigit and numCaps > 0):
+    if lower[-2:] == 'ed':
+      result = result + '-ed'
+    elif lower[-3:] == 'ing':
+      result = result + '-ing'
+    elif lower[-3:] == 'ion':
+      result = result + '-ion'
+    elif lower[-2:] == 'er':
+      result = result + '-er'
+    elif lower[-3:] == 'est':
+      result = result + '-est'
+    elif lower[-2:] == 'ly':
+      result = result + '-ly'
+    elif lower[-3:] == 'ity':
+      result = result + '-ity'
+    elif lower[-1] == 'y':
+      result = result + '-y'
+    elif lower[-2:] == 'al':
+      result = result + '-al'
+  return result
 

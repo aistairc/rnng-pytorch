@@ -163,8 +163,9 @@ def get_data(args):
 
                 for word in sent:
                     w2c[word] += 1
-        if unkmethod == 'berkeleyrule':
-            berkeley_unks = set([utils.berkeley_unk_conv(w) for w, c in w2c.items()])
+        if unkmethod == 'berkeleyrule' or unkmethod == 'berkeleyrule2':
+            conv_method = utils.berkeley_unk_conv if unkmethod == 'berkeleyrule' else utils.berkeley_unk_conv2
+            berkeley_unks = set([conv_method(w) for w, c in w2c.items()])
             specials = list(berkeley_unks)
         else:
             specials = [unk]
@@ -204,17 +205,21 @@ def get_data(args):
 
         print(len(sentences))
 
-        # Write output
-        f = {"sentences": sentences,
-             "vocab": vocab.to_json_dict(),
-             "nonterminals": nonterminals,
-             "pad_token": pad,
-             "unk_token": unk,
-             "args": args.__dict__}
-
         print("Saved {} sentences (dropped {} due to length/unk filter)".format(
-            len(f["sentences"]), dropped))
-        json.dump(f, open(outfile, 'wt'))
+            len(sentences), dropped))
+
+        with open(outfile, 'wt') as f:
+            for sent in sentences:
+                sent['key'] = 'sentence'
+                f.write(json.dumps(sent)+'\n')
+            others = {"vocab": vocab.to_json_dict(),
+                      "nonterminals": nonterminals,
+                      "pad_token": pad,
+                      "unk_token": unk,
+                      "args": args.__dict__}
+            for k, v in others.items():
+                f.write(json.dumps({'key': k, 'value': v})+'\n')
+        # json.dump(f, open(outfile, 'wt'))
 
     print("First pass through data to get nonterminals...")
     nonterminals = get_nonterminals([args.trainfile, args.valfile], args.jobs)
@@ -253,7 +258,8 @@ def main(arguments):
     parser.add_argument('--vocabminfreq', help="Minimum frequency for vocab. Use this instead of "
                                                 "vocabsize if > 1",
                                                 type=int, default=0)
-    parser.add_argument('--unkmethod', help="How to replace an unknown token.", choices=['unk', 'berkeleyrule'],
+    parser.add_argument('--unkmethod', help="How to replace an unknown token.",
+                        choices=['unk', 'berkeleyrule', 'berkeleyrule2'],
                         default='unk')
     parser.add_argument('--lowercase', help="Lower case", action='store_true')
     parser.add_argument('--replace_num', help="Replace numbers with N", action='store_true')
