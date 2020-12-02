@@ -261,7 +261,7 @@ class TestFixedStackModels(unittest.TestCase):
         x = torch.tensor([[2, 3], [1, 2]])
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
-        sent_len = x.size(1)
+        sent_len = torch.tensor([2, 2])
 
         mask = model.invalid_action_mask(beam, sent_len)
         self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only nt is allowed.
@@ -346,10 +346,11 @@ class TestFixedStackModels(unittest.TestCase):
         model.max_open_nts = 5
         model.max_cons_nts = 3
         x = torch.tensor([[2, 3], [1, 2]])
+        word_lengths = torch.tensor([2, 2])
         word_vecs = model.emb(x)
         beam_size, shift_size = 2, 1
         beam, word_completed_beam = model.build_beam_items(x, beam_size, shift_size)
-        sent_len = x.size(1)
+        sent_len = torch.tensor([2, 2])
 
         def reconstruct_and_do_action(successors, word_completed_successors):
             if word_completed_successors[0][0].size(0) > 0:
@@ -370,7 +371,7 @@ class TestFixedStackModels(unittest.TestCase):
              [[inf, inf, inf, -0.6, -0.2],
               [inf, inf, inf, inf, inf]]])
 
-        succs, wc_succs, comps = model.scores_to_successors(x, 0, beam, scores, beam_size, shift_size)
+        succs, wc_succs, comps = model.scores_to_successors(x, word_lengths, 0, beam, scores, beam_size, shift_size)
         self.assertTensorAlmostEqual(succs[0][0], torch.tensor([0, 0, 1, 1]))
         self.assertTensorAlmostEqual(succs[0][1], torch.tensor([0, 0, 0, 0]))
         self.assertTensorAlmostEqual(succs[1], torch.tensor([3, 4, 4, 3]))
@@ -399,7 +400,7 @@ class TestFixedStackModels(unittest.TestCase):
              [[inf, -0.9, inf, -0.8, -0.6],  # this shift will be fast-tracked.
               [inf, -1.4, inf, -0.7, -0.4]]])  # this shift will not be saved.
 
-        succs, wc_succs, comps = model.scores_to_successors(x, 0, beam, scores, beam_size, shift_size)
+        succs, wc_succs, comps = model.scores_to_successors(x, word_lengths, 0, beam, scores, beam_size, shift_size)
         self.assertTensorAlmostEqual(succs[0][0], torch.tensor([0, 1, 1]))  # shift (-0.1) is moved to wc_succs
         self.assertTensorAlmostEqual(succs[0][1], torch.tensor([0, 1, 0]))
         self.assertTensorAlmostEqual(succs[1], torch.tensor([3, 4, 4]))
@@ -427,7 +428,7 @@ class TestFixedStackModels(unittest.TestCase):
              [[inf, inf, inf, inf, inf],  # to test finished batch.
               [inf, inf, inf, inf, inf]]])
 
-        succs, wc_succs, comps = model.scores_to_successors(x, 0, beam, scores, beam_size, shift_size)
+        succs, wc_succs, comps = model.scores_to_successors(x, word_lengths, 0, beam, scores, beam_size, shift_size)
         self.assertTensorAlmostEqual(succs[0][0], torch.tensor([0, 0]))  # shift (-0.1) is moved to wc_succs
         self.assertTensorAlmostEqual(succs[0][1], torch.tensor([0, 0]))
         self.assertTensorAlmostEqual(succs[1], torch.tensor([3, 4]))
@@ -442,7 +443,7 @@ class TestFixedStackModels(unittest.TestCase):
         self.assertTensorAlmostEqual(word_completed_beam.beam_widths, torch.tensor([2, 1]))
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([2, 0]))
 
-        model.finalize_word_completed_beam(x, word_vecs, 0, beam, word_completed_beam, 2)
+        model.finalize_word_completed_beam(x, word_lengths, word_vecs, 0, beam, word_completed_beam, 2)
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([2, 1]))
         self.assertTensorAlmostEqual(
             beam.gen_ll[(torch.tensor([0, 0, 1]), torch.tensor([0, 1, 0]))],
@@ -464,6 +465,26 @@ class TestFixedStackModels(unittest.TestCase):
         self.assertEqual([len(s) for s in surprisals], [3, 3])
         self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
 
+    def test_beam_search_different_length(self):
+        model = self._get_simple_top_down_model()
+        x = torch.tensor([[2, 3, 4, 1, 3], [1, 2, 5, 0, 0]])
+        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+        self.assertEqual(len(parses), 2)
+        self.assertEqual(len(parses[0]), 5)
+        self.assertEqual(len(parses[1]), 5)
+
+        for parse, score in parses[1]:
+            print([model.action_dict.i2a[action] for action in parse])
+        print(surprisals[1])
+        self.assertEqual([len(s) for s in surprisals], [5, 3])
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[1]))
+
+        for parse, score in parses[0]:
+            self.assertEqual(len([a for a in parse if a == 1]), 5)  # 1 = shift
+        for parse, score in parses[1]:
+            self.assertEqual(len([a for a in parse if a == 1]), 3)
+
     def test_in_order_invalid_action_mask(self):
         model = self._get_simple_in_order_model(num_nts=2)
         model.max_open_nts = 2
@@ -471,7 +492,7 @@ class TestFixedStackModels(unittest.TestCase):
         x = torch.tensor([[2, 3], [1, 2]])
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
-        sent_len = x.size(1)
+        sent_len = torch.tensor([2, 2])
 
         mask = model.invalid_action_mask(beam, sent_len)
         self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only shift is allowed.
@@ -583,6 +604,27 @@ class TestFixedStackModels(unittest.TestCase):
         print(surprisals[0])
         self.assertEqual([len(s) for s in surprisals], [3, 3])
         self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+
+    def test_variable_beam_search_different_length(self):
+        model = self._get_simple_top_down_model()
+        x = torch.tensor([[2, 3, 4, 1, 3], [1, 2, 5, 0, 0]])
+        parses, surprisals = model.variable_beam_search(x, 50)
+        self.assertEqual(len(parses), 2)
+
+        self.assertEqual(len(set([tuple(parse) for parse, score in parses[0]])), len(parses[0]))
+        self.assertEqual(len(set([tuple(parse) for parse, score in parses[1]])), len(parses[1]))
+
+        for parse, score in parses[1]:
+            print([model.action_dict.i2a[action] for action in parse])
+        print(surprisals[1])
+        self.assertEqual([len(s) for s in surprisals], [5, 3])
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[0]))
+        self.assertTrue(all(0 < s < float('inf') for s in surprisals[1]))
+
+        for parse, score in parses[0]:
+            self.assertEqual(len([a for a in parse if a == 1]), 5)  # 1 = shift
+        for parse, score in parses[1]:
+            self.assertEqual(len([a for a in parse if a == 1]), 3)
 
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
         nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]

@@ -69,7 +69,7 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     stack_state = InOrderStackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
 
-  def invalid_action_mask(self, beam, sent_len):
+  def invalid_action_mask(self, beam, sent_lengths):
     action_order = torch.arange(self.num_actions, device=beam.nopen_parens.device)
 
     nopen_parens = beam.nopen_parens
@@ -77,6 +77,7 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     pointer = beam.stack.pointer
     top_position = beam.stack.top_position
     prev_actions = beam.prev_actions()
+    sent_lengths = sent_lengths.unsqueeze(-1)  # add beam dim
 
     # For in-order, cons_nts is accumuated by the loop of nt->reduce.
     # Except sentence final, we prohibit reduce to break this loop. Otherwise,
@@ -93,15 +94,15 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     # reduce_mask[i,j,k]=True means k is a not allowed reduce action for (i,j).
     reduce_mask = (action_order == self.action_dict.a2i['REDUCE']).view(1, 1, -1)
     reduce_mask = (((nopen_parens == 0) +
-                    (pre_nt_reduce_mask * (pointer < sent_len))).unsqueeze(-1) *
+                    (pre_nt_reduce_mask * (pointer < sent_lengths))).unsqueeze(-1) *
                    reduce_mask)
 
     finish_mask = (action_order == self.action_dict.finish_action()).view(1, 1, -1)
-    finish_mask = (((pointer != sent_len) + (nopen_parens != 0)).unsqueeze(-1) *
+    finish_mask = (((pointer != sent_lengths) + (nopen_parens != 0)).unsqueeze(-1) *
                    finish_mask)
 
     shift_mask = (action_order == self.action_dict.a2i['SHIFT']).view(1, 1, -1)
-    shift_mask = (((pointer == sent_len) +
+    shift_mask = (((pointer == sent_lengths) +
                    ((pointer > 0) * (nopen_parens == 0)) +
                    # when nopen=0, shift accompanies nt, thus requires two.
                    ((nopen_parens == 0) * (top_position >= beam.stack.stack_size-2)) +
@@ -114,12 +115,12 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     nt_mask = ((prev_is_nt +
                 (top_position == 0) +
                 # prohibit nt version of pre_nt_reduce_mask (reduce is prohibited except empty buffer)
-                (pre_nt_reduce_mask * (pointer == sent_len)) +
+                (pre_nt_reduce_mask * (pointer == sent_lengths)) +
                 # reduce is allowed after nt, so minimal room for stack is 1.
                 (top_position >= beam.stack.stack_size-1) +
                 # +1 for final finish.
                 (beam.actions.size(2) - beam.actions_pos < (
-                  sent_len - beam.stack.pointer + beam.nopen_parens + 1))).unsqueeze(-1) *
+                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 1))).unsqueeze(-1) *
                nt_mask)
 
     pad_mask = (action_order == self.action_dict.padding_idx).view(1, 1, -1)

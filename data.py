@@ -261,7 +261,7 @@ class Dataset(object):
     """
     for offset in range(0, len(self.sents), block_size):
       end = min(len(self.sents), offset + block_size)
-      len_to_idxs = self._get_len_to_idxs(range(offset, end))
+      len_to_idxs = self._get_grouped_len_to_idxs(range(offset, end))
       yield from self.batches_helper(len_to_idxs, False, True)
 
   def batches_helper(self, len_to_idxs, shuffle=True, test=False):

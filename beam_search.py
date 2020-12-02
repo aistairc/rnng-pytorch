@@ -156,8 +156,6 @@ def main(args):
       block_surprisals.extend(surprisals)
       cur_block_size += tokens.size(0)
 
-      assert all(len(s) == tokens.size(1) for s in surprisals)
-
       if cur_block_size >= args.block_size:
         assert cur_block_size == args.block_size
         sort_and_print_trees(block_idxs, block_parses, block_surprisals)
