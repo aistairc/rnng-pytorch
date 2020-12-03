@@ -14,11 +14,15 @@ from collections import defaultdict
 import utils
 import re
 import json
+from tempfile import NamedTemporaryFile
 from multiprocessing import Pool
 import itertools
 
 from data import Sentence, Vocabulary
 from action_dict import TopDownActionDict, InOrderActionDict
+
+pad = '<pad>'
+unk = '<unk>'
 
 def is_next_open_bracket(line, start_idx):
     for char in line[(start_idx + 1):]:
@@ -26,7 +30,14 @@ def is_next_open_bracket(line, start_idx):
             return True
         elif char == ')':
             return False
-    raise IndexError('Bracket possibly not balanced, open bracket not followed by closed bracket')    
+    raise IndexError('Bracket possibly not balanced, open bracket not followed by closed bracket')
+
+def get_next_bracket_index(line, start_idx):
+    for i in range(start_idx+1, len(line)):
+        char = line[i]
+        if char == '(' or char == ')':
+            return i
+    raise IndexError('Bracket possibly not balanced, open bracket not followed by closed bracket')
 
 def get_between_brackets(line, start_idx):
     output = []
@@ -39,12 +50,12 @@ def get_between_brackets(line, start_idx):
 
 def get_tags_tokens_lowercase(line):
     output = []
-    line_strip = line.rstrip()
-    for i in range(len(line_strip)):
+    line = line.rstrip()
+    for i in range(len(line)):
         if i == 0:
-            assert line_strip[i] == '('    
-        if line_strip[i] == '(' and not(is_next_open_bracket(line_strip, i)): # fulfilling this condition means this is a terminal symbol
-            output.append(get_between_brackets(line_strip, i))
+            assert line[i] == '('    
+        if line[i] == '(' and not(is_next_open_bracket(line, i)): # fulfilling this condition means this is a terminal symbol
+            output.append(get_between_brackets(line, i))
     #print 'output:',output
     output_tags = []
     output_tokens = []
@@ -56,7 +67,40 @@ def get_tags_tokens_lowercase(line):
         output_tags.append(terminal_split[0])
         output_tokens.append(terminal_split[1])
         output_lowercase.append(terminal_split[1].lower())
-    return [output_tags, output_tokens, output_lowercase]    
+    return [output_tags, output_tokens, output_lowercase]
+
+def transform_to_subword_tree(line, sp):
+    line = line.rstrip()
+    tags, tokens, _ = get_tags_tokens_lowercase(line)
+    pieces = sp.encode(' '.join(tokens), out_type=str)
+    end_idxs = [i+1 for i, p in enumerate(pieces) if '▁' in p]
+    begin_idxs = [0] + end_idxs[:-1]
+    spans = list(zip(begin_idxs, end_idxs))  # map from original token idx to piece span idxs.
+
+    def get_piece_preterms(tok_i):
+        tag = tags[tok_i]
+        b, e = spans[tok_i]
+        span_pieces = pieces[b:e]
+        return ' '.join(['({} {})'.format(tag, p) for p in span_pieces])
+
+    new_preterms = [get_piece_preterms(i) for i in range(len(tokens))]
+    orig_token_spans = []
+    for i in range(len(line)):
+        if line[i] == '(':
+            next_bracket_idx = get_next_bracket_index(line, i)
+            found_bracket = line[next_bracket_idx]
+            if found_bracket == '(':
+                continue  # not terminal -> skip
+            orig_token_spans.append((i, next_bracket_idx+1))
+    assert len(new_preterms) == len(orig_token_spans)
+    ex_span_ends = [span[0] for span in orig_token_spans] + [len(line)]
+    ex_span_begins = [0] + [span[1] for span in orig_token_spans]
+    parts = []
+    for i in range(len(new_preterms)):
+        parts.append(line[ex_span_begins[i]:ex_span_ends[i]])
+        parts.append(new_preterms[i])
+    parts.append(line[ex_span_begins[i+1]:ex_span_ends[i+1]])
+    return ''.join(parts)
 
 def get_nonterminal(line, start_idx):
     assert line[start_idx] == '(' # make sure it's an open bracket
@@ -100,11 +144,6 @@ def get_actions(line):
     assert i == max_idx
     return output_actions
 
-def pad(ls, length, symbol):
-    if len(ls) >= length:
-        return ls[:length]
-    return ls + [symbol] * (length -len(ls))
-
 def find_nts_in_tree(tree):
     tree = tree.strip()
     return re.findall(r'(?=\(([^\s]+)\s\()', tree)
@@ -112,7 +151,11 @@ def find_nts_in_tree(tree):
 def get_sent_info(arg):
     tree, setting = arg
     tree = tree.strip()
-    lowercase, replace_num, vocab, action_dict, io_action_dict = setting
+    lowercase, replace_num, vocab, sp, action_dict, io_action_dict = setting
+    if sp is not None:
+        # use sentencepiece
+        tree = transform_to_subword_tree(tree, sp)
+    tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
     top_down_actions = get_actions(tree)
     in_order_actions = utils.get_in_order_actions(tree)
     top_down_max_stack_size = utils.get_top_down_max_stack_size(top_down_actions)
@@ -120,14 +163,21 @@ def get_sent_info(arg):
     tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
     orig_tokens = tokens[:]
     assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
-    if lowercase:
-        tokens = tokens_lower
-    if replace_num:
-        tokens = [utils.clean_number(w) for w in tokens]
-    token_ids = [vocab.get_id(t) for t in tokens]
+    if sp is None:
+        # these are not applied with sentencepiece
+        if lowercase:
+            tokens = tokens_lower
+        if replace_num:
+            tokens = [utils.clean_number(w) for w in tokens]
+
+        token_ids = [vocab.get_id(t) for t in tokens]
+        conved_tokens = [vocab.i2w[w_i] for w_i in token_ids]
+    else:
+        token_ids = sp.piece_to_id(tokens)
+        conved_tokens = tokens
+
     top_down_action_ids = action_dict.to_id(top_down_actions)
     in_order_action_ids = io_action_dict.to_id(in_order_actions)
-    conved_tokens = [vocab.i2w[w_i] for w_i in token_ids]
 
     return {
         'orig_tokens': orig_tokens,
@@ -143,39 +193,63 @@ def get_sent_info(arg):
         'tree_str': tree
     }
 
-def get_data(args):
-    pad = '<pad>'
-    unk = '<unk>'
-    def make_vocab(textfile, seqlength, minseqlength,lowercase, replace_num,
-                   vocabsize, vocabminfreq, unkmethod, apply_length_filter=True):
-        w2c = defaultdict(int)
-        with open(textfile, 'r') as f:
-            trees = [tree.strip() for tree in f]
+def make_vocab(textfile, seqlength, minseqlength, lowercase, replace_num,
+               vocabsize, vocabminfreq, unkmethod, jobs, apply_length_filter=True):
+    w2c = defaultdict(int)
+    with open(textfile, 'r') as f:
+        trees = [tree.strip() for tree in f]
+    with Pool(jobs) as pool:
+        for tags, sent, sent_lower in pool.map(get_tags_tokens_lowercase, trees):
+            assert(len(tags) == len(sent))
+            if lowercase:
+                sent = sent_lower
+            if replace_num:
+                sent = [utils.clean_number(w) for w in sent]
+            if (len(sent) > seqlength and apply_length_filter) or len(sent) < minseqlength:
+                continue
+
+            for word in sent:
+                w2c[word] += 1
+    if unkmethod == 'berkeleyrule' or unkmethod == 'berkeleyrule2':
+        conv_method = utils.berkeley_unk_conv if unkmethod == 'berkeleyrule' else utils.berkeley_unk_conv2
+        berkeley_unks = set([conv_method(w) for w, c in w2c.items()])
+        specials = list(berkeley_unks)
+    else:
+        specials = [unk]
+    if vocabminfreq:
+        w2c = dict([(w, c) for w, c in w2c.items() if c >= vocabminfreq])
+    elif vocabsize > 0 and len(w2c) > vocabsize:
+        sorted_wc = sorted(list(w2c.items()), key=lambda x:x[1], reverse=True)
+        w2c = dict(sorted_wc[:vocabsize])
+    return Vocabulary(list(w2c.items()), pad, unkmethod, unk, specials)
+
+def learn_sentencepiece(textfile, output_prefix, args, apply_length_filter=True):
+    import sentencepiece as spm
+    with open(textfile, 'r') as f:
+        trees = [tree.strip() for tree in f]
+    user_defined_symbols = args.subword_user_defined_symbols or []
+    if args.keep_ptb_bracket:
+        user_defined_symbols += ['-LRB-', '-RRB-']
+    with NamedTemporaryFile('wt') as tmp:
         with Pool(args.jobs) as pool:
             for tags, sent, sent_lower in pool.map(get_tags_tokens_lowercase, trees):
                 assert(len(tags) == len(sent))
-                if lowercase:
-                    sent = sent_lower
-                if replace_num:
-                    sent = [utils.clean_number(w) for w in sent]
-                if (len(sent) > seqlength and apply_length_filter) or len(sent) < minseqlength:
+                if (len(sent) > args.seqlength and apply_length_filter) or len(sent) < args.minseqlength:
                     continue
+                tmp.write(' '.join(sent)+'\n')
+        tmp.flush()
+        spm.SentencePieceTrainer.train(
+            input=tmp.name,
+            model_prefix=output_prefix,
+            vocab_size=args.vocabsize,
+            model_type=args.subword_type,
+            treat_whitespace_as_suffix=True,
+            pad_id=0, unk_id=1, bos_id=2, eos_id=3,
+            user_defined_symbols=user_defined_symbols,
+        )
+    return spm.SentencePieceProcessor(model_file='{}.model'.format(output_prefix))
 
-                for word in sent:
-                    w2c[word] += 1
-        if unkmethod == 'berkeleyrule' or unkmethod == 'berkeleyrule2':
-            conv_method = utils.berkeley_unk_conv if unkmethod == 'berkeleyrule' else utils.berkeley_unk_conv2
-            berkeley_unks = set([conv_method(w) for w, c in w2c.items()])
-            specials = list(berkeley_unks)
-        else:
-            specials = [unk]
-        if vocabminfreq:
-            w2c = dict([(w, c) for w, c in w2c.items() if c >= vocabminfreq])
-        elif vocabsize > 0 and len(w2c) > vocabsize:
-            sorted_wc = sorted(list(w2c.items()), key=lambda x:x[1], reverse=True)
-            w2c = dict(sorted_wc[:vocabsize])
-        return Vocabulary(list(w2c.items()), pad, unkmethod, unk, specials)
-
+def get_data(args):
     def get_nonterminals(textfiles, jobs=-1):
         nts = set()
         for fn in textfiles:
@@ -189,10 +263,10 @@ def get_data(args):
         return nts
 
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
-                outfile, vocab, action_dict, io_action_dict, apply_length_filter=True, jobs=-1):
+                outfile, vocab, sp, action_dict, io_action_dict, apply_length_filter=True, jobs=-1):
         dropped = 0
         sentences = []
-        conv_setting = (lowercase, replace_num, vocab, action_dict, io_action_dict)
+        conv_setting = (lowercase, replace_num, vocab, sp, action_dict, io_action_dict)
         with open(textfile, 'r') as f:
             tree_with_settings = [(tree, conv_setting) for tree in f]
         with Pool(jobs) as pool:
@@ -212,55 +286,70 @@ def get_data(args):
             for sent in sentences:
                 sent['key'] = 'sentence'
                 f.write(json.dumps(sent)+'\n')
-            others = {"vocab": vocab.to_json_dict(),
+            others = {"vocab": vocab.to_json_dict() if vocab is not None else None,
                       "nonterminals": nonterminals,
                       "pad_token": pad,
                       "unk_token": unk,
                       "args": args.__dict__}
             for k, v in others.items():
                 f.write(json.dumps({'key': k, 'value': v})+'\n')
-        # json.dump(f, open(outfile, 'wt'))
 
     print("First pass through data to get nonterminals...")
     nonterminals = get_nonterminals([args.trainfile, args.valfile], args.jobs)
     action_dict = TopDownActionDict(nonterminals)
     io_action_dict = InOrderActionDict(nonterminals)
 
-    if args.vocabfile != '':
-        print('Loading pre-specified source vocab from ' + args.vocabfile)
-        vocab = Vocabulary.load(args.vocabfile)
+    if args.unkmethod == 'subword':
+        print('unkmethod subword is selected. Running sentencepiece on the training data...')
+        sp = learn_sentencepiece(args.trainfile, args.outputfile+'-spm', args)
+        vocab = None
     else:
-        print("Second pass through data to get vocab...")
-        vocab = make_vocab(args.trainfile, args.seqlength, args.minseqlength,
-                           args.lowercase, args.replace_num, args.vocabsize, args.vocabminfreq,
-                           args.unkmethod, 1)
+        if args.vocabfile != '':
+            print('Loading pre-specified source vocab from ' + args.vocabfile)
+            vocab = Vocabulary.load(args.vocabfile)
+        else:
+            print("Second pass through data to get vocab...")
+            vocab = make_vocab(args.trainfile, args.seqlength, args.minseqlength,
+                               args.lowercase, args.replace_num, args.vocabsize, args.vocabminfreq,
+                               args.unkmethod, args.jobs)
+        vocab.dump(args.outputfile + ".vocab")
+        print("Vocab size: {}".format(len(vocab.i2w)))
+        sp = None
 
-    vocab.dump(args.outputfile + ".vocab")
-    print("Vocab size: {}".format(len(vocab.i2w)))
     convert(args.testfile, args.lowercase, args.replace_num,
             0, args.minseqlength, args.outputfile + "-test.json",
-            vocab, action_dict, io_action_dict, 0, args.jobs)
+            vocab, sp, action_dict, io_action_dict, 0, args.jobs)
     convert(args.valfile, args.lowercase, args.replace_num,
             args.seqlength, args.minseqlength, args.outputfile + "-val.json",
-            vocab, action_dict, io_action_dict, 0, args.jobs)
+            vocab, sp, action_dict, io_action_dict, 0, args.jobs)
     convert(args.trainfile, args.lowercase, args.replace_num,
             args.seqlength,  args.minseqlength, args.outputfile + "-train.json",
-            vocab, action_dict, io_action_dict, 1, args.jobs)
+            vocab, sp, action_dict, io_action_dict, 1, args.jobs)
 
 def main(arguments):
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    parser.add_argument('--vocabsize', help="Size of source vocabulary, constructed "
-                                            "by taking the top X most frequent words. "
-                                            " Rest are replaced with special UNK tokens.",
-                                       type=int, default=100000)
-    parser.add_argument('--vocabminfreq', help="Minimum frequency for vocab. Use this instead of "
-                                                "vocabsize if > 1",
-                                                type=int, default=0)
+    parser.add_argument('--vocabsize',
+                        help="Size of vocabulary or subword vocabulary. "
+                        "When unkmethod is not subword, vocab is constructed "
+                        "by taking the top X most frequent words and "
+                        "rest are replaced with special UNK tokens. "
+                        "If unkmethod=subword, this defines the subword vocabulary size. ",
+                        type=int, default=100000)
+    parser.add_argument('--vocabminfreq',
+                        help="Minimum frequency for vocab. "
+                        "When this value > 0, this value is used instead of vocabsize.",
+                        type=int, default=0)
     parser.add_argument('--unkmethod', help="How to replace an unknown token.",
-                        choices=['unk', 'berkeleyrule', 'berkeleyrule2'],
+                        choices=['unk', 'berkeleyrule', 'berkeleyrule2', 'subword'],
                         default='unk')
+    parser.add_argument('--subword_type', help="Segmentation algorithm in sentencepiece. Note that --treat_whitespace_as_suffix for sentence_piece is always True.",
+                        choices=['bpe', 'unigram'], default='bpe')
+    parser.add_argument('--keep_ptb_bracket', action='store_true',
+                        help='Recommended for English PTB-like dataset. Do not segment -LRB- and -RRB- into subwords. (other brackets, such as -LCB-, are kept (may be segmented), considering their low frequency.)')
+    parser.add_argument('--subword_user_defined_symbols', nargs='*',
+                        help='--user_defined_symbols for sentencepiece. These tokens are not segmented into subwords.')
     parser.add_argument('--lowercase', help="Lower case", action='store_true')
     parser.add_argument('--replace_num', help="Replace numbers with N", action='store_true')
     parser.add_argument('--trainfile', help="Path to training data.", required=True)

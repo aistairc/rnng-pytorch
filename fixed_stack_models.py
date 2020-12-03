@@ -721,8 +721,8 @@ class FixedStackRNNG(nn.Module):
     loss = self.word_criterion(logit, x)
     return loss, logit
 
-  def word_sync_beam_search(self, x, beam_size, word_beam_size = 0, shift_size = 0,
-                            stack_size_bound = 100,
+  def word_sync_beam_search(self, x, subword_end_mask, beam_size, word_beam_size = 0,
+                            shift_size = 0, stack_size_bound = 100,
                             return_beam_history = False):
     self.eval()
     sent_lengths = (x != self.padding_idx).sum(dim=1)
@@ -756,7 +756,8 @@ class FixedStackRNNG(nn.Module):
 
       while not finished_batches.all():
         added_forced_completions = self.beam_step(
-          x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, shift_size)
+          x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
+          word_completed_beam, shift_size)
         forced_completions += added_forced_completions
         finished_batches = word_finished_batches()
         beam.beam_widths[finished_batches.nonzero(as_tuple=True)] = 0  # inactive word-finished batches.
@@ -779,10 +780,11 @@ class FixedStackRNNG(nn.Module):
     ret = (parses, surprisals)
     return ret
 
-  def beam_step(self, x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, shift_size):
+  def beam_step(self, x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
+                word_completed_beam, shift_size):
     beam_size = beam.beam_size
     successors, word_completed_successors, added_forced_completions \
-      = self.get_successors(x, sent_lengths, pointer, beam, beam_size, shift_size)
+      = self.get_successors(x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size)
 
     # tuple of ((batch_idxs, beam_idxs), next_actions, total_scores)
     assert len(successors) == len(word_completed_successors) == 3
@@ -803,9 +805,10 @@ class FixedStackRNNG(nn.Module):
 
     return added_forced_completions
 
-  def variable_beam_step(self, x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, K):
+  def variable_beam_step(self, x, subword_end_mask, sent_lengths, word_vecs, pointer,
+                         beam, word_completed_beam, K):
     successors, word_completed_successors \
-      = self.get_successors_by_particle_filter(x, sent_lengths, pointer, beam)
+      = self.get_successors_by_particle_filter(x, subword_end_mask, sent_lengths, pointer, beam)
     # successors: ((batch_idx, beam_idx), action, gen_ll, disc_ll, K)
     if word_completed_successors[0][0].size(0) > 0:
       comp_idxs = tuple(word_completed_successors[0])
@@ -882,7 +885,7 @@ class FixedStackRNNG(nn.Module):
     stack_state = StackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
 
-  def variable_beam_search(self, x, K, original_reweight=False, stack_size_bound=100):
+  def variable_beam_search(self, x, subword_end_mask, K, original_reweight=False, stack_size_bound=100):
     self.eval()
     sent_lengths = (x != self.padding_idx).sum(dim=1)
     max_beam_size = min(K//2, 1000)
@@ -905,7 +908,8 @@ class FixedStackRNNG(nn.Module):
       bucket_i = 0
       while not ((beam.beam_widths == 0) +
                  (word_completed_beam.beam_widths == word_completed_beam.beam_size-1)).all():
-        self.variable_beam_step(x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, K)
+        self.variable_beam_step(
+          x, subword_end_mask, sent_lengths, word_vecs, pointer, beam, word_completed_beam, K)
         bucket_i += 1
 
       self.finalize_particle_beam(
@@ -939,13 +943,13 @@ class FixedStackRNNG(nn.Module):
     states = self.initial_states(x)
     return [[ParticleBeamItem.from_initial_state(state, K)] for state in states]
 
-  def get_successors(self, x, sent_lengths, pointer, beam, beam_size, shift_size):
+  def get_successors(self, x, subword_end_mask, sent_lengths, pointer, beam, beam_size, shift_size):
     if pointer < x.size(1):
       next_x = x[:, pointer]
     else:
       next_x = None
 
-    invalid_action_mask = self.invalid_action_mask(beam, sent_lengths)  # (total beam size, n_actions)
+    invalid_action_mask = self.invalid_action_mask(beam, sent_lengths, subword_end_mask)  # (total beam size, n_actions)
 
     log_probs = self.action_log_probs(beam.stack, invalid_action_mask, next_x)  # (batch, beam, n_actions)
     # scores for inactive beam items (outside active_idx) are -inf on log_probs so we need
@@ -954,13 +958,13 @@ class FixedStackRNNG(nn.Module):
 
     return self.scores_to_successors(x, sent_lengths, pointer, beam, log_probs, beam_size, shift_size)
 
-  def get_successors_by_particle_filter(self, x, sent_lengths, pointer, beam):
+  def get_successors_by_particle_filter(self, x, subword_end_mask, sent_lengths, pointer, beam):
     if pointer < x.size(1):
       next_x = x[:, pointer]
     else:
       next_x = None
 
-    invalid_action_mask = self.invalid_action_mask(beam, sent_lengths)  # (total beam size, n_actions)
+    invalid_action_mask = self.invalid_action_mask(beam, sent_lengths, subword_end_mask)  # (total beam size, n_actions)
 
     # nan is already transformed to -inf.
     log_probs, disc_log_probs = self.action_log_probs(
@@ -1063,18 +1067,25 @@ class FixedStackRNNG(nn.Module):
     else:
       return log_probs
 
-  def invalid_action_mask(self, beam, sent_lengths):
+  def invalid_action_mask(self, beam, sent_lengths, subword_end_mask):
     """Return a tensor where mask[i,j,k]=True means action k is not allowed for beam (i,j).
     """
     action_order = torch.arange(self.num_actions, device=beam.nopen_parens.device)
 
     sent_lengths = sent_lengths.unsqueeze(-1)  # add beam dimension
+
+    prev_pointer = beam.stack.pointer - 1
+    prev_pointer[prev_pointer == -1] = 0
+    prev_is_subword_mask = ((beam.stack.pointer > 0) *
+                            (subword_end_mask.gather(1, prev_pointer) == 0))
     # reduce_mask[i,j,k]=True means k is a not allowed reduce action for (i,j).
     reduce_mask = (action_order == self.action_dict.a2i['REDUCE']).view(1, 1, -1)
     reduce_mask = ((((beam.nopen_parens == 1) * (beam.stack.pointer < sent_lengths)) +
                     # prev is nt => cannot reduce immediately after nt
                     (beam.prev_actions() >= self.action_dict.nt_begin_id()) +
-                    (beam.stack.top_position < 2)).unsqueeze(-1) *
+                    (beam.stack.top_position < 2) +
+                    # only shift is allowed when prev is subword
+                    prev_is_subword_mask).unsqueeze(-1) *
                    reduce_mask)
 
     # nt_mask[i,j,k]=True means k is a not allowed nt action for (i,j).
@@ -1086,7 +1097,9 @@ class FixedStackRNNG(nn.Module):
                   sent_lengths - beam.stack.pointer + beam.nopen_parens + 1)) +
                 # Check the storage of fixed stack size (we need minimally two additional
                 # elements to process arbitrary future structure).
-                (beam.stack.top_position >= beam.stack.stack_size-2)).unsqueeze(-1) *
+                (beam.stack.top_position >= beam.stack.stack_size-2) +
+                # only shift is allowed when prev is subword
+                prev_is_subword_mask).unsqueeze(-1) *
                nt_mask)
 
     shift_mask = (action_order == self.action_dict.a2i['SHIFT']).view(1, 1, -1)

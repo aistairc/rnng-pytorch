@@ -21,7 +21,7 @@ import torch.nn.functional as F
 import numpy as np
 import time
 import logging
-from data import Dataset
+from data import Dataset, SentencePieceVocabulary
 from models import TopDownRNNG
 from in_order_models import InOrderRNNG
 from fixed_stack_models import FixedStackRNNG
@@ -36,6 +36,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--train_file', default='data/ptb-no-unk-train.json')
 parser.add_argument('--val_file', default='data/ptb-no-unk-val.json')
 parser.add_argument('--train_from', default='')
+parser.add_argument('--sp_model', default='',
+                    help='Subword-tokenized treebank should be trained with this argument. Path to trained sentencepiece model.')
 # Model options
 parser.add_argument('--fixed_stack', action='store_true')
 parser.add_argument('--strategy', default='top_down', choices=['top_down', 'in_order'])
@@ -51,9 +53,9 @@ parser.add_argument('--not_swap_in_order_stack', action='store_true',
 # Optimization options
 parser.add_argument('--batch_group', choices=['same_length', 'random', 'similar_length', 'similar_action_length'],
                     default='similar_length', help='Sentences are grouped by this criterion to make each batch.')
-parser.add_argument('--max_group_length_diff', default=20,
+parser.add_argument('--max_group_length_diff', default=20, type=int,
                     help='When --batch_group=similar_length or similar_action_length, maximum (token or action) length difference in a single batch does not exceed this.')
-parser.add_argument('--group_sentence_size', default=1024,
+parser.add_argument('--group_sentence_size', default=1024, type=int,
                     help='When --batch_group=similar_length, sentences are first sorted by length and grouped by this number of sentences, from which each batch is sampled.')
 parser.add_argument('--optimizer', default='adam', choices=['sgd', 'adam'], help='Which optimizer to use.')
 parser.add_argument('--lr_scheduler', default=None, choices=['plateau', 'warmup'])
@@ -169,7 +171,14 @@ def main(args):
   if args.device == 'cuda':
     torch.cuda.manual_seed(args.seed)
 
-  train_data = Dataset.from_json(args.train_file, args.batch_size, random_unk=args.random_unk,
+  if len(args.sp_model) > 0:
+    logger.info('Load sentencepiece vocabulary from {}'.format(args.sp_model))
+    vocab = SentencePieceVocabulary(args.sp_model)
+  else:
+    vocab = None
+
+  train_data = Dataset.from_json(args.train_file, args.batch_size, vocab=vocab,
+                                 random_unk=args.random_unk,
                                  oracle=args.strategy, batch_group=args.batch_group,
                                  batch_token_size=args.batch_token_size,
                                  batch_action_size=args.batch_action_size,

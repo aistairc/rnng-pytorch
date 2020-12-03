@@ -56,15 +56,19 @@ class TopDownActionDict:
 
         return torch.tensor(action_ids, device=device)
 
-    def build_tree_str(self, actions, tokens, tags):
+    def build_tree_str(self, actions, tokens, tags, subword_end_mask = None):
         ret = ''
         tok_i = 0
+        subword_i = 0
         for a in actions:
             if self.is_nt(a):
                 ret += ' ( {} '.format(self.nonterminals[self.nt_id(a)])
             elif self.is_shift(a):
-                ret += ' ( {} {} ) '.format(tags[tok_i], tokens[tok_i])
-                tok_i += 1
+                if ((subword_end_mask is None) or
+                    (subword_end_mask is not None and subword_end_mask[subword_i])):
+                    ret += ' ( {} {} ) '.format(tags[tok_i], tokens[tok_i])
+                    tok_i += 1
+                subword_i += 1
             elif self.is_reduce(a):
                 ret += ' ) '
 
@@ -102,17 +106,21 @@ class InOrderActionDict(TopDownActionDict):
     def finish_action(self):
         return 3
 
-    def build_tree_str(self, actions, tokens, tags):
+    def build_tree_str(self, actions, tokens, tags, subword_end_mask = None):
         stack = []
         tok_i = 0
+        subword_i = 0
         for a in actions:
             if self.is_nt(a):
                 top = stack.pop()
                 stack.append(' ( {} '.format(self.nonterminals[self.nt_id(a)]))
                 stack.append(top)
             elif self.is_shift(a):
-                stack.append(' ( {} {} ) '.format(tags[tok_i], tokens[tok_i]))
-                tok_i += 1
+                if ((subword_end_mask is None) or
+                    (subword_end_mask is not None and subword_end_mask[subword_i])):
+                    ret += ' ( {} {} ) '.format(tags[tok_i], tokens[tok_i])
+                    tok_i += 1
+                subword_i += 1
             elif self.is_reduce(a):
                 open_idx = len(stack) - 1
                 while not ('(' in stack[open_idx] and ')' not in stack[open_idx]):

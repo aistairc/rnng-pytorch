@@ -69,7 +69,7 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     stack_state = InOrderStackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
 
-  def invalid_action_mask(self, beam, sent_lengths):
+  def invalid_action_mask(self, beam, sent_lengths, subword_end_mask):
     action_order = torch.arange(self.num_actions, device=beam.nopen_parens.device)
 
     nopen_parens = beam.nopen_parens
@@ -91,10 +91,23 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
     pre_nt_reduce_mask = ((nopen_parens > self.max_open_nts-1) +
                           (ncons_nts > self.max_cons_nts-1))
 
+    prev_pointer = beam.stack.pointer - 1
+    prev_prev_pointer = beam.stack.pointer - 2
+    prev_pointer[prev_pointer < 0] = 0
+    prev_prev_pointer[prev_prev_pointer < 0] = 0
+    prev_is_subword_mask = (beam.stack.pointer > 0) * (subword_end_mask.gather(1, prev_pointer) == 0)
+    prev_is_subword_begin_mask = ((beam.stack.pointer > 0) *
+                                  # prev is first word => always subword
+                                  ((beam.stack.pointer == 1) +
+                                   # prev is after end subword => begin of subword
+                                   subword_end_mask.gather(1, prev_prev_pointer)))
+
     # reduce_mask[i,j,k]=True means k is a not allowed reduce action for (i,j).
     reduce_mask = (action_order == self.action_dict.a2i['REDUCE']).view(1, 1, -1)
     reduce_mask = (((nopen_parens == 0) +
-                    (pre_nt_reduce_mask * (pointer < sent_lengths))).unsqueeze(-1) *
+                    (pre_nt_reduce_mask * (pointer < sent_lengths)) +
+                    # reduce is only allowed when prev is not subword
+                    prev_is_subword_mask).unsqueeze(-1) *
                    reduce_mask)
 
     finish_mask = (action_order == self.action_dict.finish_action()).view(1, 1, -1)
@@ -120,7 +133,8 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
                 (top_position >= beam.stack.stack_size-1) +
                 # +1 for final finish.
                 (beam.actions.size(2) - beam.actions_pos < (
-                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 1))).unsqueeze(-1) *
+                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 1)) +
+                (prev_is_subword_begin_mask == 0)).unsqueeze(-1) *
                nt_mask)
 
     pad_mask = (action_order == self.action_dict.padding_idx).view(1, 1, -1)

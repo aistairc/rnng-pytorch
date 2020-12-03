@@ -262,8 +262,9 @@ class TestFixedStackModels(unittest.TestCase):
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
         sent_len = torch.tensor([2, 2])
+        subword_end_mask = x != 0
 
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only nt is allowed.
             [[[1, 1, 1, 0, 0],
               [1, 1, 1, 1, 1]],  # beam idx 1 does not exist.
@@ -278,7 +279,7 @@ class TestFixedStackModels(unittest.TestCase):
             beam.do_action(actions, model.action_dict)
 
         do_action(torch.tensor([[3, 3], [3, 3]]))  # (S, S); (S, S)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 0, 0],
               [1, 0, 1, 0, 0]],
@@ -286,7 +287,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 0, 1, 0, 0]]]))
 
         do_action(torch.tensor([[3, 3], [3, 1]]))  # (S, S); (S, shift)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 0, 0],
               [1, 0, 1, 0, 0]],
@@ -294,7 +295,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 0, 1, 0, 0]]]))  # still reduce is prohibited (because this is not final token)
 
         do_action(torch.tensor([[3, 1], [3, 1]]))  # (S, shift); (S, shift)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 1, 1],  # max_cons_nt = 3
               [1, 0, 0, 0, 0]],
@@ -302,7 +303,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 1]]]))  # reduce is allowed; no shift word
 
         do_action(torch.tensor([[1, 2], [1, 2]]))  # (shift, r); (shift, r)  # (1, 1) finished
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 0, 0, 0],
               [1, 0, 1, 0, 0]],
@@ -310,7 +311,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 1, 1, 1]]]))
 
         do_action(torch.tensor([[3, 1], [1, 0]]))  # (S, shift); (shift, -)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 0, 0],
               [1, 1, 0, 1, 1]],
@@ -318,7 +319,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 1, 1, 1]]]))
 
         do_action(torch.tensor([[3, 2], [2, 0]]))  # (S, r); (r, -)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 1, 1],  # max_open_nts = 5
               [1, 1, 1, 1, 1]],
@@ -326,7 +327,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 1, 1, 1]]]))
 
         do_action(torch.tensor([[1, 0], [2, 0]]))  # (shift, -); (r, -)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 1],  # max_open_nts = 5
               [1, 1, 1, 1, 1]],
@@ -334,7 +335,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 1, 1, 1]]]))
 
         do_action(torch.tensor([[2, 0], [2, 0]]))  # (r, -); (r, -)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 1],  # max_open_nts = 5
               [1, 1, 1, 1, 1]],
@@ -346,6 +347,7 @@ class TestFixedStackModels(unittest.TestCase):
         model.max_open_nts = 5
         model.max_cons_nts = 3
         x = torch.tensor([[2, 3], [1, 2]])
+        subword_end_mask = x != 0
         word_lengths = torch.tensor([2, 2])
         word_vecs = model.emb(x)
         beam_size, shift_size = 2, 1
@@ -387,7 +389,7 @@ class TestFixedStackModels(unittest.TestCase):
 
         # This is actually the test for reconstruct_and_do_action defined above
         # (a part of model.beam_step).
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 0, 0],
               [1, 0, 1, 0, 0]],
@@ -414,7 +416,7 @@ class TestFixedStackModels(unittest.TestCase):
         reconstruct_and_do_action(succs, wc_succs)
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([1, 2]))
 
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 0, 0],
               [1, 1, 1, 1, 1]],
@@ -452,7 +454,8 @@ class TestFixedStackModels(unittest.TestCase):
     def test_beam_search(self):
         model = self._get_simple_top_down_model()
         x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+        subword_end_mask = x != 0
+        parses, surprisals = model.word_sync_beam_search(x, subword_end_mask, 8, 5, 1)
         self.assertEqual(len(parses), 2)
         self.assertEqual(len(parses[0]), 5)
 
@@ -468,7 +471,8 @@ class TestFixedStackModels(unittest.TestCase):
     def test_beam_search_different_length(self):
         model = self._get_simple_top_down_model()
         x = torch.tensor([[2, 3, 4, 1, 3], [1, 2, 5, 0, 0]])
-        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+        subword_end_mask = x != 0
+        parses, surprisals = model.word_sync_beam_search(x, subword_end_mask, 8, 5, 1)
         self.assertEqual(len(parses), 2)
         self.assertEqual(len(parses[0]), 5)
         self.assertEqual(len(parses[1]), 5)
@@ -490,11 +494,12 @@ class TestFixedStackModels(unittest.TestCase):
         model.max_open_nts = 2
         model.max_cons_nts = 2
         x = torch.tensor([[2, 3], [1, 2]])
+        subword_end_mask = x != 0
         word_vecs = model.emb(x)
         beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
         sent_len = torch.tensor([2, 2])
 
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only shift is allowed.
             [[[1, 0, 1, 1, 1, 1],
               [1, 1, 1, 1, 1, 1]],  # beam idx 1 does not exist.
@@ -509,7 +514,7 @@ class TestFixedStackModels(unittest.TestCase):
             beam.do_action(actions, model.action_dict)
 
         do_action(torch.tensor([[1, 1], [1, 1]]))  # (shift, shift); (shift, shift)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 1, 1, 0, 0],
               [1, 1, 1, 1, 0, 0]],
@@ -517,7 +522,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 1, 1, 0, 0]]]))
 
         do_action(torch.tensor([[4, 4], [4, 4]]))  # (S, S); (S, S)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 0, 1, 1, 1],
               [1, 0, 0, 1, 1, 1]],
@@ -525,7 +530,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 0, 0, 1, 1, 1]]]))
 
         do_action(torch.tensor([[2, 1], [2, 1]]))  # (r, shift); (r, shift)  # reset ncons_nt
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 1, 1, 0, 0],  # (S w)
               [1, 1, 0, 1, 0, 0]],  # (S w w
@@ -533,7 +538,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 0, 0]]]))  # (S w w
 
         do_action(torch.tensor([[4, 2], [4, 4]]))  # (S, r); (S, S)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 0, 1, 1, 1, 1],  # (S (S w)  ncons_nt=2 -> no more reduce
               [1, 1, 1, 0, 0, 0]],  # (S w w)
@@ -541,7 +546,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 1, 1]]]))  # (S w (S w
 
         do_action(torch.tensor([[1, 3], [1, 2]]))  # (shift, finish); (shift, r)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 0, 0],  # (S (S w) w
               [1, 1, 1, 1, 1, 1]],  # (S w w) finish
@@ -549,7 +554,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 0, 0]]]))  # (S w (S w)
 
         do_action(torch.tensor([[4, 0], [4, 4]]))  # (S, -); (S, S)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 1, 1],  # (S (S w) (S w
               [1, 1, 1, 1, 1, 1]],  # (S w w) finish
@@ -557,7 +562,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S w) ncons_nt=2 -> still can reduce (since sentence final)
 
         do_action(torch.tensor([[2, 0], [2, 2]]))  # (r, -); (r, r)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 0, 0],  # (S (S w) (S w)
               [1, 1, 1, 1, 1, 1]],
@@ -565,7 +570,7 @@ class TestFixedStackModels(unittest.TestCase):
               [1, 1, 0, 1, 1, 1]]]))  # (S w (S (S w)) ncons_nt=2 -> no more nt
 
         do_action(torch.tensor([[4, 0], [2, 4]]))  # (S, -); (r, S)
-        mask = model.invalid_action_mask(beam, sent_len)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
         self.assertTensorAlmostEqual(mask, torch.tensor(
             [[[1, 1, 0, 1, 1, 1],  # (S (S w) (S (S w)
               [1, 1, 1, 1, 1, 1]],
@@ -575,7 +580,8 @@ class TestFixedStackModels(unittest.TestCase):
     def test_in_order_beam_search(self):
         model = self._get_simple_in_order_model()
         x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        parses, surprisals = model.word_sync_beam_search(x, 8, 5, 1)
+        subword_end_mask = x != 1
+        parses, surprisals = model.word_sync_beam_search(x, subword_end_mask, 8, 5, 1)
         self.assertEqual(len(parses), 2)
         self.assertEqual(len(parses[0]), 5)
 
@@ -591,7 +597,8 @@ class TestFixedStackModels(unittest.TestCase):
     def test_variable_beam_search(self):
         model = self._get_simple_top_down_model()
         x = torch.tensor([[2, 3, 4], [1, 2, 5]])
-        parses, surprisals = model.variable_beam_search(x, 50)
+        subword_end_mask = x > 0
+        parses, surprisals = model.variable_beam_search(x, subword_end_mask, 50)
 
         self.assertEqual(len(parses), 2)
         self.assertTrue(len(parses[0]) > 0)
@@ -608,7 +615,8 @@ class TestFixedStackModels(unittest.TestCase):
     def test_variable_beam_search_different_length(self):
         model = self._get_simple_top_down_model()
         x = torch.tensor([[2, 3, 4, 1, 3], [1, 2, 5, 0, 0]])
-        parses, surprisals = model.variable_beam_search(x, 50)
+        subword_end_mask = x != 1
+        parses, surprisals = model.variable_beam_search(x, subword_end_mask, 50)
         self.assertEqual(len(parses), 2)
 
         self.assertEqual(len(set([tuple(parse) for parse, score in parses[0]])), len(parses[0]))

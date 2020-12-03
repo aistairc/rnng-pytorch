@@ -35,6 +35,9 @@ class Vocabulary(object):
     if self.unkmethod == 'unk':
       self.unk_id = self.w2i[self.unktoken]
 
+  def id_to_word(self, i):
+    return self.i2w[i]
+
   def to_unk(self, w):
     if self.unkmethod == 'unk':
       return self.unktoken
@@ -110,6 +113,37 @@ class Vocabulary(object):
     return Vocabulary(d['word_count'], d['pad'], d['unkmethod'], d['unktoken'],
                       d['specials'])
 
+class SentencePieceVocabulary(object):
+  def __init__(self, sp_model_path):
+    import sentencepiece as spm
+    self.sp = spm.SentencePieceProcessor(model_file=sp_model_path)
+    self.padding_idx = self.sp.pad_id()
+    self.pad = self.sp.id_to_piece(self.padding_idx)
+    self.unkmethod = 'subword'
+    self.unk_id = self.sp.unk_id()
+    self.unktoken = self.sp.id_to_piece(self.unk_id)
+
+  def id_to_word(self, i):
+    return self.sp.id_to_piece(i)
+
+  def to_unk(self, w):
+    assert False, "SentencePieceVocabulary should not call to_unk()"
+
+  def to_unk_id(self, w_id):
+    assert False, "SentencePieceVocabulary should not call to_unk_id()"
+
+  def size(self):
+    return self.sp.get_piece_size()
+
+  def get_id(self, w):
+    return self.sp.piece_to_id(w)
+
+  def get_count_from_id(self, w_id):
+    return 1
+
+  def get_count(self, w):
+    return 1
+
 class Sentence(object):
   def __init__(self, orig_tokens, tokens, token_ids, tags,
                actions=None, action_ids=None, tree_str=None,
@@ -149,6 +183,29 @@ class Sentence(object):
         return w_id
     return [unkify_rand(i) for i in self.token_ids]
 
+  def get_word_end_mask(self):
+    if any('▁' in t for t in self.tokens):
+      # subword-tokenized
+      return ['▁' in t for t in self.tokens]
+    else:
+      return [True for t in self.tokens]
+
+  def get_subword_span_index(self):
+    """
+    Given tokens = ["In▁", "an▁", "Oct", ".▁", "19▁"],
+    return [[0], [1], [2, 3], [4]].
+    """
+    word_end_mask = self.get_word_end_mask()
+    idxs = []
+    cur_word_idx = []
+    for i, is_end in enumerate(word_end_mask):
+      cur_word_idx.append(i)
+      if is_end:
+        idxs.append(cur_word_idx)
+        cur_word_idx = []
+    assert idxs[-1][-1] == len(self.tokens)-1  # tokens is subword-segmented.
+    return idxs
+
   def to_dict(self):
     return {'orig_tokens': self.orig_tokens, 'tokens': self.tokens,
             'token_ids': self.token_ids,'tags': self.tags,
@@ -168,6 +225,8 @@ class Dataset(object):
     self.action_dict = action_dict
     self.random_unk = random_unk
     self.prepro_args = prepro_args  # keeps which process is performed.
+
+    self.use_subwords = isinstance(self.vocab, SentencePieceVocabulary)
 
     self.vocab_size = vocab.size()
     if batch_group == 'same_length':
@@ -247,12 +306,16 @@ class Dataset(object):
       for line in f:
         orig_tokens = line.strip().split()
         tokens = orig_tokens[:]
-        if prepro_args.get('lowercase', False):
-          tokens = [t.lower() for t in tokens]
-        if prepro_args.get('replace_num', False):
-          tokens = [clean_number(t) for t in tokens]
-        token_ids = [vocab.get_id(t) for t in tokens]
-        tags = tagger_fn(tokens)
+        if isinstance(vocab, SentencePieceVocabulary):
+          tokens = vocab.sp.encode(' '.join(tokens), out_type=str)
+          token_ids = vocab.sp.piece_to_id(tokens)
+        else:
+          if prepro_args.get('lowercase', False):
+            tokens = [t.lower() for t in tokens]
+          if prepro_args.get('replace_num', False):
+            tokens = [clean_number(t) for t in tokens]
+          token_ids = [vocab.get_id(t) for t in tokens]
+        tags = tagger_fn(orig_tokens)
         sent = Sentence(orig_tokens, tokens, token_ids, tags)
         sents.append(sent)
     return Dataset(sents, batch_size, vocab, action_dict, False, prepro_args, batch_token_size,
@@ -301,7 +364,12 @@ class Dataset(object):
     for offset in range(0, len(self.sents), block_size):
       end = min(len(self.sents), offset + block_size)
       len_to_idxs = self._get_grouped_len_to_idxs(range(offset, end))
-      yield from self.batches_helper(len_to_idxs, False, True)
+      for tokens, batch_idx in self.batches_helper(len_to_idxs, False, True):
+        if self.use_subwords:
+          subword_end_mask = self.get_subword_end_mask(batch_idx)
+        else:
+          subword_end_mask = torch.full(tokens.size(), 1, dtype=torch.bool)
+        yield tokens, subword_end_mask, batch_idx
 
   def batches_helper(self, len_to_idxs, shuffle=True, test=False):
     # `len_to_idxs` summarizes sentence length to idx in `self.sents`.
@@ -328,12 +396,12 @@ class Dataset(object):
         cur_action_len = len(self.sents[idxs[i]].action_ids)
         longest_sent_len = max(longest_sent_len, cur_sent_len)
         longest_action_len = max(longest_action_len, cur_action_len)
-        if len(self.sents[idxs[i]].token_ids) > 100:
-          # Long sequence often requires larger memory and tend to cause memory error.
-          # Here we try to reduce the elements in a batch for such sequences, considering
-          # that they are rare and will not affect the total speed much.
-          batch_token_size = self.batch_token_size // 2
-          batch_action_size = self.batch_action_size // 2
+        # if len(self.sents[idxs[i]].token_ids) > 100:
+        #   # Long sequence often requires larger memory and tend to cause memory error.
+        #   # Here we try to reduce the elements in a batch for such sequences, considering
+        #   # that they are rare and will not affect the total speed much.
+        #   batch_token_size = self.batch_token_size // 2
+        #   batch_action_size = self.batch_action_size // 2
         if ((longest_sent_len * (batch_i+1) >= batch_token_size) or
             (longest_action_len * (batch_i+1) >= batch_action_size) or
             (batch_i > 0 and batch_i % self.batch_size == 0)):
@@ -368,6 +436,10 @@ class Dataset(object):
                 max_stack_size)
       ret += (batch_idx,)
       yield ret
+
+  def get_subword_end_mask(self, sent_idxs):
+    is_token_end = [self.sents[i].get_word_end_mask() for i in sent_idxs]
+    return torch.tensor(pad_items(is_token_end, 0)[0], dtype=torch.bool)
 
   def _get_len_to_idxs(self, sent_idxs = []):
     def to_len(token_ids):
