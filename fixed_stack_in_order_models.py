@@ -7,8 +7,8 @@ import numpy as np
 from fixed_stack_models import BeamItems, FixedStack, FixedStackRNNG, StackState
 
 class FixedInOrderStack(FixedStack):
-  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1, tree_dtype = torch.float32):
-    super(FixedInOrderStack, self).__init__(initial_hidden, stack_size, input_size, beam_size, tree_dtype)
+  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
+    super(FixedInOrderStack, self).__init__(initial_hidden, stack_size, input_size, beam_size)
 
   def do_nt(self, nt_batches, nt_embs, nt_ids):
     left_corner = self.trees[nt_batches + (self.top_position[nt_batches]-1,)]

@@ -126,7 +126,7 @@ class AttentionComposition(nn.Module):
 
 
 class FixedStack:
-  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1, tree_dtype = torch.float32):
+  def __init__(self, initial_hidden, stack_size, input_size, beam_size = 1):
     super(FixedStack, self).__init__()
     device = initial_hidden[1].device
     hidden_size = initial_hidden[0].size(-2)
@@ -150,7 +150,7 @@ class FixedStack:
     self.top_position = torch.zeros(batch_size, dtype=torch.long, device=device)  # stack top position
     self.hiddens = initial_hidden[0].new_zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
     self.cells = initial_hidden[0].new_zeros(batch_size + (stack_size+1, hidden_size, num_layers), device=device)
-    self.trees = torch.zeros(batch_size + (stack_size, input_size), device=device, dtype=tree_dtype)
+    self.trees = initial_hidden[0].new_zeros(batch_size + (stack_size, input_size), device=device)
 
     if beam_size == 1:
       self.hiddens[:, 0] = initial_hidden[0]
@@ -193,7 +193,7 @@ class FixedStack:
 
   def do_reduce(self, reduce_batches, new_child):
     prev_nt_position = self.nt_index[reduce_batches + (self.nt_index_pos[reduce_batches],)]
-    self.trees[reduce_batches + (prev_nt_position-1,)] = new_child.to(self.trees.dtype)
+    self.trees[reduce_batches + (prev_nt_position-1,)] = new_child
     self.nt_index_pos[reduce_batches] = self.nt_index_pos[reduce_batches] - 1
     self.top_position[reduce_batches] = prev_nt_position
 
@@ -593,13 +593,13 @@ class RNNGCell(nn.Module):
     # the input to stack_rnn.
     if shift_batches[0].size(0) > 0:
       shift_idx = stack.pointer[shift_batches].view(-1, 1, 1).expand(-1, 1, word_vecs.size(-1))
-      shifted_embs = torch.gather(word_vecs[shift_batches[0]], 1, shift_idx).squeeze(1)
+      shifted_embs = torch.gather(word_vecs[shift_batches[0]], 1, shift_idx).squeeze(1).to(new_input.dtype)
       stack.do_shift(shift_batches, shifted_embs)
       new_input[shift_batches] = shifted_embs
 
     if nt_batches[0].size(0) > 0:
       nt_ids = (actions[nt_batches] - self.action_dict.nt_begin_id())
-      nt_embs = self.nt_emb(nt_ids)
+      nt_embs = self.nt_emb(nt_ids).to(new_input.dtype)
       stack.do_nt(nt_batches, nt_embs, nt_ids)
       new_input[nt_batches] = nt_embs
 
@@ -688,8 +688,7 @@ class FixedStackRNNG(nn.Module):
 
   def build_stack(self, x, stack_size = 80):
     initial_hidden = self.rnng.get_initial_hidden(x)
-    return FixedStack(initial_hidden, stack_size, self.input_size,
-                      tree_dtype=self.emb[0].weight.dtype)
+    return FixedStack(initial_hidden, stack_size, self.input_size)
 
   def action_loss(self, actions, action_dict, hiddens):
     assert hiddens.size()[:2] == actions.size()
@@ -880,8 +879,7 @@ class FixedStackRNNG(nn.Module):
                       True, particle, K))
 
   def new_beam_stack_with_state(self, initial_hidden, stack_size, beam_size):
-    stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size,
-                       tree_dtype=self.emb[0].weight.dtype)
+    stack = FixedStack(initial_hidden, stack_size, self.input_size, beam_size)
     stack_state = StackState(initial_hidden[0].size(0), beam_size, initial_hidden[0].device)
     return stack, stack_state
 
