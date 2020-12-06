@@ -118,7 +118,7 @@ class InOrderActionDict(TopDownActionDict):
             elif self.is_shift(a):
                 if ((subword_end_mask is None) or
                     (subword_end_mask is not None and subword_end_mask[subword_i])):
-                    ret += ' ( {} {} ) '.format(tags[tok_i], tokens[tok_i])
+                    stack.append(' ( {} {} ) '.format(tags[tok_i], tokens[tok_i]))
                     tok_i += 1
                 subword_i += 1
             elif self.is_reduce(a):
