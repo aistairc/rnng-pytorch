@@ -131,9 +131,9 @@ class FixedStackInOrderRNNG(FixedStackRNNG):
                 (pre_nt_reduce_mask * (pointer == sent_lengths)) +
                 # reduce is allowed after nt, so minimal room for stack is 1.
                 (top_position >= beam.stack.stack_size-1) +
-                # +1 for final finish.
+                # +3 for the same reason as top-down parser; +1 for final finish.
                 (beam.actions.size(2) - beam.actions_pos < (
-                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 1)) +
+                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 4)) +
                 (prev_is_subword_begin_mask == 0)).unsqueeze(-1) *
                nt_mask)
 

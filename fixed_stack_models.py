@@ -1091,8 +1091,10 @@ class FixedStackRNNG(nn.Module):
     nt_mask = (((beam.nopen_parens >= self.max_open_nts) +
                 (beam.ncons_nts >= self.max_cons_nts) +
                 # Check the storage of beam.actions, which is bounded beforehand.
+                # Theoretically +1 seems sufficient (for rhs); extra +2 is for saving cases
+                # where other actions (reduce/shift) are prohibited for some reasons.
                 (beam.actions.size(2) - beam.actions_pos < (
-                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 1)) +
+                  sent_lengths - beam.stack.pointer + beam.nopen_parens + 3)) +
                 # Check the storage of fixed stack size (we need minimally two additional
                 # elements to process arbitrary future structure).
                 (beam.stack.top_position >= beam.stack.stack_size-2) +
