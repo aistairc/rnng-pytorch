@@ -24,7 +24,7 @@ from utils import *
 from in_order_models import InOrderRNNG
 from fixed_stack_in_order_models import FixedStackInOrderRNNG
 
-logger = logging.getLogger('train')
+logger = logging.getLogger(__name__)
 
 parser = argparse.ArgumentParser()
 
