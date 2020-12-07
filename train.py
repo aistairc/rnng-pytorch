@@ -74,7 +74,7 @@ parser.add_argument('--num_epochs', default=18, type=int, help='number of traini
 parser.add_argument('--min_epochs', default=8, type=int, help='do not decay learning rate for at least this many epochs')
 # parser.add_argument('--decay_cond_epochs', default=1, type=int, help='decay learning rate if loss does not improve conscutively this many steps')
 parser.add_argument('--lr', default=0.001, type=float, help='starting learning rate')
-parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action'])
+parser.add_argument('--loss_normalize', default='batch', choices=['sum', 'batch', 'action', 'token'])
 # parser.add_argument('--decay', default=0.5, type=float, help='')
 parser.add_argument('--param_init', default=0, type=float, help='parameter initialization (over uniform)')
 parser.add_argument('--max_grad_norm', default=5, type=float, help='gradient clipping parameter')
@@ -281,6 +281,8 @@ def main(args):
           loss = loss / token_ids.size(0)
         elif args.loss_normalize == 'action':
           loss = loss / a_loss.size(0)
+        elif args.loss_normalize == 'token':
+          loss = loss / w_loss.size(0)
         return loss, a_loss, w_loss
 
       if args.amp:
