@@ -124,16 +124,26 @@ def main(args):
         print()
 
   if args.particle_filter:
-    def parse(model, tokens, subword_end_mask, return_beam_history=False):
+    def parse(tokens, subword_end_mask, return_beam_history = False, stack_size_bound = -1):
       return model.variable_beam_search(tokens, subword_end_mask, args.particle_size,
                                         args.original_reweight,
-                                        stack_size_bound=args.stack_size_bound)
+                                        stack_size_bound=stack_size_bound)
   else:
-    def parse(model, tokens, subword_end_mask, return_beam_history=False):
+    def parse(tokens, subword_end_mask, return_beam_history=False, stack_size_bound = -1):
       return model.word_sync_beam_search(
         tokens, subword_end_mask, args.beam_size, args.word_beam_size, args.shift_size,
         return_beam_history=return_beam_history,
-        stack_size_bound=args.stack_size_bound)
+        stack_size_bound=stack_size_bound)
+
+  def try_parse(tokens, subword_end_mask, stack_size_bound = None):
+    stack_size_bound = args.stack_size_bound if stack_size_bound is None else -1
+    if args.dump_beam:
+      parses, surprisals, beam_history = parse(tokens, subword_end_mask, True, stack_size_bound)
+      dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
+    else:
+      parses, surprisals = parse(tokens, subword_end_mask, False, stack_size_bound)
+      beam_history = None
+    return parses, surprisals, beam_history
 
   start_time = time.time()
   with torch.no_grad():
@@ -147,11 +157,26 @@ def main(args):
       tokens, subword_end_mask, batch_idx = batch
       tokens = tokens.to(device)
       subword_end_mask = subword_end_mask.to(device)
-      if args.dump_beam:
-        parses, surprisals, beam_history = parse(model, tokens, subword_end_mask, True)
-        dump_histroy(beam_history, [dataset.sents[idx] for idx in batch_idx])
-      else:
-        parses, surprisals = parse(model, tokens, subword_end_mask, False)
+      parses, surprisals, beam_history = try_parse( tokens, subword_end_mask)
+      if any(len(p) == 0 for p in parses):
+        # parse failure (on some tree in a batch)
+        failed_sents = [(idx, " ".join(dataset.sents[idx].orig_tokens)) for p, idx
+                        in zip(parses, batch_idx) if len(p) == 0]
+        failed_sents_str = "\n".join("{}: {}".format(i, s) for i, s in failed_sents)
+        logger.warning("Parse failure occurs on the following "
+                       "sentence(s):\n{}".format(failed_sents_str))
+        if args.stack_size_bound < tokens.size(1):
+          # one reason of parse failure is stack is filled with many tokens with only
+          # a very little nonterminals at the beginning of stack
+          # (e.g., (NP x x x x x x x ... ). Reduce is impossible and thus the parser is
+          # stuck.
+          # Here, we try to reparse the sentence with increased stack size
+          # by setting it -1, which will be (sent_len+10) internally in beam search.
+          logger.warning("Current sack size bound {} is smaller than "
+                         "sentence length {}.".format(args.stack_size_bound, tokens.size(1)))
+          logger.warning("Try to reparse with increased stack size bound...")
+          parses, surprisals, beam_history = try_parse(tokens, subword_end_mask,
+                                                       stack_size_bound = -1)
 
       best_actions = [p[0][0] for p in parses]  # p[0][1] is likelihood
       subword_end_mask = subword_end_mask.cpu().numpy()
