@@ -235,9 +235,8 @@ def main(args):
 
   global_batch_i = 0
   tb = TensorBoardLogger(args)
-  while epoch < args.num_epochs:
+  while epoch <= args.num_epochs:
     start_time = time.time()
-    #epoch += 1
     logger.info('Starting epoch {}'.format(epoch))
     num_sents = 0.
     num_words = 0.
