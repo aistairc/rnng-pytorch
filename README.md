@@ -7,7 +7,7 @@ Most of the code should work with PyTorch 1.5 or above. However, if you use mixe
 We first convert a PTB-style dataset (examples found in `data/` folder) into a single json file by preprocessing, which converts each parse tree into tokens, ids (after unkifying), oracle actions, etc:
 ```
 $ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
---outputfile data/ptb --vocabminfreq 1 --unkmethod berkeleyrule
+--outputfile data/ptb --vocabminfreq 2 --unkmethod berkeleyrule
 ```
 By `--unkmethod berkeleyrule`, an unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indicates an unknown token ending with `ly` suffix (e.g., nominally).
 
