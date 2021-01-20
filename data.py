@@ -385,7 +385,7 @@ class Dataset(object):
 
       longest_sent_len = 0
       longest_action_len = 0
-      batch_i = 0
+      batch_i = 0   # for i-th batch
       b = 0
       batch_token_size = self.batch_token_size
       batch_action_size = self.batch_action_size
@@ -396,15 +396,16 @@ class Dataset(object):
         cur_action_len = len(self.sents[idxs[i]].action_ids)
         longest_sent_len = max(longest_sent_len, cur_sent_len)
         longest_action_len = max(longest_action_len, cur_action_len)
-        # if len(self.sents[idxs[i]].token_ids) > 100:
-        #   # Long sequence often requires larger memory and tend to cause memory error.
-        #   # Here we try to reduce the elements in a batch for such sequences, considering
-        #   # that they are rare and will not affect the total speed much.
-        #   batch_token_size = self.batch_token_size // 2
-        #   batch_action_size = self.batch_action_size // 2
-        if ((longest_sent_len * (batch_i+1) >= batch_token_size) or
+        if len(self.sents[idxs[i]].token_ids) > 100:
+          # Long sequence often requires larger memory and tend to cause memory error.
+          # Here we try to reduce the elements in a batch for such sequences, considering
+          # that they are rare and will not affect the total speed much.
+          batch_token_size = int(self.batch_token_size * 0.7)
+          batch_action_size = int(self.batch_action_size * 0.7)
+        if (i > b and (  # for ensuring batch size 1
+            (longest_sent_len * (batch_i+1) >= batch_token_size) or
             (longest_action_len * (batch_i+1) >= batch_action_size) or
-            (batch_i > 0 and batch_i % self.batch_size == 0)):
+            (batch_i > 0 and batch_i % self.batch_size == 0))):
           add_batch(b, i)
           batch_i = 0  # i is not included in prev batch
           longest_sent_len = cur_sent_len
