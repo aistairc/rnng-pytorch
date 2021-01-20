@@ -7,6 +7,7 @@ import json
 import random
 import shutil
 import copy
+import math
 
 import torch
 from torch import cuda
@@ -87,6 +88,8 @@ parser.add_argument('--valid_every', type=int, default=-1, help='If > 0, validat
 parser.add_argument('--tensorboard_log_dir', default='',
                     help='If not empty, tensor board summaries are recorded on the directory `tensor_board_log_dir/save_path`')
 parser.add_argument('--amp', action='store_true')
+parser.add_argument('--early_stop', action='store_true', help='Stop learning if loss monotonically increases --early_stop_patience times (default=5)')
+parser.add_argument('--early_stop_patience', type=int, default=5)
 
 class TensorBoardLogger(object):
   def __init__(self, args):
@@ -202,6 +205,12 @@ def main(args):
   epoch = 1
   val_losses = []
 
+  def is_early_stop():
+    return (args.early_stop and
+            len(val_losses) > max(10, args.early_stop_patience) and
+            all([val_losses[-i-2] < val_losses[-i-1] for i in range(args.early_stop_patience-1)])
+            )
+
   if args.train_from == '':
     model = create_model(args, action_dict, vocab).to(device)
     optimizer = create_optimizer(args, model)
@@ -235,7 +244,7 @@ def main(args):
 
   global_batch_i = 0
   tb = TensorBoardLogger(args)
-  while epoch <= args.num_epochs:
+  while epoch <= args.num_epochs and not is_early_stop():
     start_time = time.time()
     logger.info('Starting epoch {}'.format(epoch))
     num_sents = 0.
@@ -264,51 +273,88 @@ def main(args):
                   ))
       return ppl, word_ppl, action_ppl
 
+    def calc_loss(token_ids, action_ids):
+      loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
+      if args.loss_normalize == 'sum':
+        loss = loss
+      elif args.loss_normalize == 'batch':
+        loss = loss / token_ids.size(0)
+      elif args.loss_normalize == 'action':
+        loss = loss / a_loss.size(0)
+      elif args.loss_normalize == 'token':
+        loss = loss / w_loss.size(0)
+      return loss, a_loss, w_loss
+
+    def batch_step(token_ids, action_ids, num_divides):
+      optimizer.zero_grad()
+      block_size = token_ids.size(0) // num_divides
+      total_a_loss = 0
+      total_w_loss = 0
+      num_as = 0
+      num_ws = 0
+      for begin_idx in range(0, token_ids.size(0), block_size):
+        div_token_ids = token_ids[begin_idx:begin_idx+block_size]
+        div_action_ids = action_ids[begin_idx:begin_idx+block_size]
+        loss, a_loss, w_loss = calc_loss(div_token_ids, div_action_ids)
+        if num_divides > 1:
+          loss  = loss / num_divides
+        if args.amp:
+          scaler.scale(loss).backward()
+        else:
+          loss.backward()
+        total_a_loss += -a_loss.sum().detach().item()
+        total_w_loss += -w_loss.sum().detach().item()
+        num_as += a_loss.size(0)
+        num_ws += w_loss.size(0)
+      return total_a_loss, total_w_loss, num_as, num_ws
+
+    def try_batch_step(token_ids, action_ids, num_divides = 1):
+      try:
+        return batch_step(token_ids, action_ids, num_divides)
+      except RuntimeError as e:  # memory error -> retry by reducing batch size
+        # Error is processed outside this scope.
+        # A hack to prevent memory leak when handling oov.
+        # https://pytorch.org/docs/stable/notes/faq.html#my-out-of-memory-exception-handler-can-t-allocate-memory
+        msg = str(e)
+
+      torch.cuda.empty_cache()
+      logger.warning(msg)
+      logger.warning('Memory error occurs: token batch: {}, action batch: {}'.format(
+        token_ids.size(), action_ids.size()
+      ))
+      logger.warning('Retry by halfing batch sizes...')
+      return try_batch_step(token_ids, action_ids, num_divides * 2)
+
     for batch in train_data.batches():
       token_ids, action_ids, max_stack_size, batch_idx = batch
       token_ids = token_ids.to(device)
       action_ids = action_ids.to(device)
       b += 1
       global_batch_i += 1
-      optimizer.zero_grad()
+      # optimizer.zero_grad()
 
-      def calc_loss():
-        loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
-        if args.loss_normalize == 'sum':
-          loss = loss
-        elif args.loss_normalize == 'batch':
-          loss = loss / token_ids.size(0)
-        elif args.loss_normalize == 'action':
-          loss = loss / a_loss.size(0)
-        elif args.loss_normalize == 'token':
-          loss = loss / w_loss.size(0)
-        return loss, a_loss, w_loss
+      batch_ll = try_batch_step(token_ids, action_ids)
+      total_a_ll += batch_ll[0]
+      total_w_ll += batch_ll[1]
 
       if args.amp:
-        with torch.cuda.amp.autocast():
-          loss, a_loss, w_loss = calc_loss()
-        scaler.scale(loss).backward()
         if args.max_grad_norm > 0:
           scaler.unscale_(optimizer)
           torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         scaler.step(optimizer)
         scaler.update()
       else:
-        loss, a_loss, w_loss = calc_loss()
-        loss.backward()
         if args.max_grad_norm > 0:
           torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
         optimizer.step()
 
       if not isinstance(scheduler, ReduceLROnPlateau):
         scheduler.step()
-      total_a_ll += -a_loss.sum().detach().item()
-      total_w_ll += -w_loss.sum().detach().item()
 
       num_sents += token_ids.size(0)
       # assert token_ids.size(0) * token_ids.size(1) == w_loss.size(0)
-      num_words += w_loss.size(0)
-      num_actions += a_loss.size(0)
+      num_actions += batch_ll[2]
+      num_words += batch_ll[3]
 
       # trying to obtain a discrete value that would have meaning at each epoch boundary.
       continuous_epoch = int(((epoch-1) + (b / len(train_data))) * 10000)
