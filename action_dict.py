@@ -110,14 +110,17 @@ class InOrderActionDict(TopDownActionDict):
         stack = []
         tok_i = 0
         subword_i = 0
+        def begin_of_subword():
+            return ((subword_end_mask is None) or
+                    (subword_end_mask is not None and (
+                        subword_i == 0 or subword_end_mask[subword_i-1])))
         for a in actions:
             if self.is_nt(a):
                 top = stack.pop()
                 stack.append(' ( {} '.format(self.nonterminals[self.nt_id(a)]))
                 stack.append(top)
             elif self.is_shift(a):
-                if ((subword_end_mask is None) or
-                    (subword_end_mask is not None and subword_end_mask[subword_i])):
+                if begin_of_subword():
                     stack.append(' ( {} {} ) '.format(tags[tok_i], tokens[tok_i]))
                     tok_i += 1
                 subword_i += 1
