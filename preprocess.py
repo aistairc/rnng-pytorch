@@ -155,14 +155,16 @@ def get_sent_info(arg):
     if sp is not None:
         # use sentencepiece
         tree = transform_to_subword_tree(tree, sp)
+    subword_tokenized = sp is not None
     tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
     top_down_actions = get_actions(tree)
-    in_order_actions = utils.get_in_order_actions(tree)
+    in_order_actions = utils.get_in_order_actions(tree, subword_tokenized)
     top_down_max_stack_size = utils.get_top_down_max_stack_size(top_down_actions)
-    in_order_max_stack_size = utils.get_in_order_max_stack_size(in_order_actions)
+    assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
+    in_order_max_stack_size = utils.get_in_order_max_stack_size(
+        in_order_actions, tokens, subword_tokenized)
     tags, tokens, tokens_lower = get_tags_tokens_lowercase(tree)
     orig_tokens = tokens[:]
-    assert len([a for a in in_order_actions if a == 'SHIFT']) == len(tokens)
     if sp is None:
         # these are not applied with sentencepiece
         if lowercase:

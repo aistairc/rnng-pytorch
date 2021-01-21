@@ -276,7 +276,7 @@ class Dataset(object):
         k = o['key']
         if k == 'sentence':
           # Unused values are discarded here (for reducing memory for larger data).
-          o['tree_str'] = o['tokens'] = o['actions'] = o['in_order_actions'] = o['tags'] = None
+          o['tree_str'] = o['actions'] = o['in_order_actions'] = o['tags'] = None
           sents.append(o)
         else:
           # key except 'sentence' should only appear once
@@ -364,12 +364,7 @@ class Dataset(object):
     for offset in range(0, len(self.sents), block_size):
       end = min(len(self.sents), offset + block_size)
       len_to_idxs = self._get_grouped_len_to_idxs(range(offset, end))
-      for tokens, batch_idx in self.batches_helper(len_to_idxs, False, True):
-        if self.use_subwords:
-          subword_end_mask = self.get_subword_end_mask(batch_idx)
-        else:
-          subword_end_mask = torch.full(tokens.size(), 1, dtype=torch.bool)
-        yield tokens, subword_end_mask, batch_idx
+      yield from self.batches_helper(self.len_to_idxs, False, True)
 
   def batches_helper(self, len_to_idxs, shuffle=True, test=False):
     # `len_to_idxs` summarizes sentence length to idx in `self.sents`.
@@ -429,13 +424,18 @@ class Dataset(object):
 
     for batch_idx in batches:
       token_ids = [conv_sent(i) for i in batch_idx]
-      ret = (torch.tensor(self._pad_token_ids(token_ids), dtype=torch.long),)
+      tokens = torch.tensor(self._pad_token_ids(token_ids), dtype=torch.long)
+      ret = (tokens,)
       if not test:
         action_ids = [self.sents[i].action_ids for i in batch_idx]
         max_stack_size = max([self.sents[i].max_stack_size for i in batch_idx])
         ret += (torch.tensor(self._pad_action_ids(action_ids), dtype=torch.long),
                 max_stack_size)
-      ret += (batch_idx,)
+      if self.use_subwords:
+        subword_end_mask = self.get_subword_end_mask(batch_idx)
+      else:
+        subword_end_mask = torch.full(tokens.size(), 1, dtype=torch.bool)
+      ret += (subword_end_mask, batch_idx,)
       yield ret
 
   def get_subword_end_mask(self, sent_idxs):

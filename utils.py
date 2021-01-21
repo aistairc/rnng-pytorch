@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from nltk import Tree
 
-def get_in_order_actions(line):
+def get_in_order_actions(line, subword_tokenized=False):
   def get_actions_recur(tree, actions=[]):
     if len(tree) == 1:
       if isinstance(tree[0], str):  # preterminal
@@ -16,8 +16,18 @@ def get_in_order_actions(line):
         actions.append('NT({})'.format(tree.label()))
         actions.append('REDUCE')
     else:  # multiple children
-      left_corner, others = tree[0], tree[1:]
-      actions = get_actions_recur(left_corner, actions)
+      if subword_tokenized and isinstance(tree[0][0], str):
+        # multiple pieces could be left_corner
+        i = 0
+        while i < len(tree) and '▁' not in tree[i][0]:
+          i += 1
+        seg = i+1
+      else:
+        seg = 1
+      left_corners, others = tree[:seg], tree[seg:]
+      for lc in left_corners:
+        actions = get_actions_recur(lc, actions)
+      # actions = sum([get_actions_recur(lc, actions) for lc in left_corners], [])
       actions.append('NT({})'.format(tree.label()))
       for c in others:
         actions = get_actions_recur(c, actions)
@@ -46,20 +56,29 @@ def get_top_down_max_stack_size(actions):
   assert len(stack) == 1
   return max_size
 
-def get_in_order_max_stack_size(actions):
+def get_in_order_max_stack_size(actions, tokens, subword_tokenized=False):
   stack = []
   max_size = 0
+  tok_i = 0
   for a in actions:
     if a == 'SHIFT':
-      stack.append('w')
+      stack.append(tokens[tok_i])
+      tok_i += 1
     elif a[:2] == 'NT':
-      lc = stack.pop()
+      lc = [stack.pop()]
+      if subword_tokenized:
+        assert lc[0] == 1 or '▁' in lc[0]
+        if lc[0] != 1:
+          # may need to further pop (lc may be multiple tokens)
+          while (len(stack) > 0 and not (stack[-1] == 1 or '▁' in stack[-1])):
+            lc.append(stack.pop())
+          lc = lc[::-1]
       stack.append('(')
-      stack.append(lc)
+      stack.extend(lc)
     elif a == 'REDUCE':
       while stack[-1] != '(':
         stack.pop()
-      stack[-1] = 'w'
+      stack[-1] = 1  # 0 means a constituent (not use a str to distinguish from tokens)
     max_size = max(max_size, len(stack))
   assert len(stack) == 1
   return max_size

@@ -216,7 +216,7 @@ class FixedStack(ExpandableStorage):
     else:
       return self.cells[batches + (self.top_position[batches]-offset,)]
 
-  def do_shift(self, shift_batches, shifted_embs):
+  def do_shift(self, shift_batches, shifted_embs, subword_end_mask = None):
     self.trees[shift_batches + (self.top_position[shift_batches],)] = shifted_embs
     self.pointer[shift_batches] = self.pointer[shift_batches] + 1
     self.top_position[shift_batches] = self.top_position[shift_batches] + 1
@@ -270,24 +270,13 @@ class FixedStack(ExpandableStorage):
         _idx = _idx.unsqueeze(-1)
       return torch.gather(tensor, sort_idx.dim()-1, _idx.expand(tensor.size()))
 
-    self.pointer = sort_tensor(self.pointer)
-    self.top_position = sort_tensor(self.top_position)
-    self.hiddens = sort_tensor(self.hiddens)
-    self.cells = sort_tensor(self.cells)
-    self.trees = sort_tensor(self.trees)
-    self.nt_index = sort_tensor(self.nt_index)
-    self.nt_ids = sort_tensor(self.nt_ids)
-    self.nt_index_pos = sort_tensor(self.nt_index_pos)
+    for a in self.attrs:
+      old_x = getattr(self, a)
+      setattr(self, a, sort_tensor(old_x))
 
   def move_beams(self, self_move_idxs, other, move_idxs):
-    self.pointer[self_move_idxs] = other.pointer[move_idxs]
-    self.top_position[self_move_idxs] = other.top_position[move_idxs]
-    self.hiddens[self_move_idxs] = other.hiddens[move_idxs]
-    self.cells[self_move_idxs] = other.cells[move_idxs]
-    self.trees[self_move_idxs] = other.trees[move_idxs]
-    self.nt_index[self_move_idxs] = other.nt_index[move_idxs]
-    self.nt_ids[self_move_idxs] = other.nt_ids[move_idxs]
-    self.nt_index_pos[self_move_idxs] = other.nt_index_pos[move_idxs]
+    for a in self.attrs:
+      getattr(self, a)[self_move_idxs] = getattr(other, a)[move_idxs]
 
 
 class StackState(ExpandableStorage):
@@ -645,7 +634,7 @@ class RNNGCell(nn.Module):
     iemb = self.initial_emb(x.new_zeros(x.size(0), dtype=torch.long))
     return self.stack_rnn(iemb, None)
 
-  def forward(self, word_vecs, actions, stack):
+  def forward(self, word_vecs, actions, stack, subword_end_mask = None):
     """
     Similar to update_stack_rnn.
 
@@ -664,7 +653,7 @@ class RNNGCell(nn.Module):
     if shift_batches[0].size(0) > 0:
       shift_idx = stack.pointer[shift_batches].view(-1, 1, 1).expand(-1, 1, word_vecs.size(-1))
       shifted_embs = torch.gather(word_vecs[shift_batches[0]], 1, shift_idx).squeeze(1).to(new_input.dtype)
-      stack.do_shift(shift_batches, shifted_embs)
+      stack.do_shift(shift_batches, shifted_embs, subword_end_mask)
       new_input[shift_batches] = shifted_embs
 
     if nt_batches[0].size(0) > 0:
@@ -730,7 +719,8 @@ class FixedStackRNNG(nn.Module):
     self.max_open_nts = max_open_nts
     self.max_cons_nts = max_cons_nts
 
-  def forward(self, x, actions, initial_stack = None, stack_size_bound = -1):
+  def forward(self, x, actions, initial_stack = None, stack_size_bound = -1,
+              subword_end_mask = None):
     assert isinstance(x, torch.Tensor)
     assert isinstance(actions, torch.Tensor)
 
@@ -740,18 +730,18 @@ class FixedStackRNNG(nn.Module):
       stack_size = stack_size_bound
     stack = self.build_stack(x, stack_size)
     word_vecs = self.emb(x)
-    action_contexts = self.unroll_states(stack, word_vecs, actions)
+    action_contexts = self.unroll_states(stack, word_vecs, actions, subword_end_mask)
 
     a_loss, _ = self.action_loss(actions, self.action_dict, action_contexts)
     w_loss, _ = self.word_loss(x, actions, self.action_dict, action_contexts)
     loss = (a_loss.sum() + w_loss.sum())
     return loss, a_loss, w_loss, stack
 
-  def unroll_states(self, stack, word_vecs, actions):
+  def unroll_states(self, stack, word_vecs, actions, subword_end_mask = None):
     hs = word_vecs.new_zeros(actions.size(1), word_vecs.size(0), self.hidden_size)
     hs[0] = stack.hidden_head()[:, :, -1]
     for step in range(actions.size(1)-1):
-      h = self.rnng(word_vecs, actions[:, step], stack)  # (batch_size, input_size)
+      h = self.rnng(word_vecs, actions[:, step], stack, subword_end_mask)  # (batch_size, input_size)
       hs[step+1] = h
     hs = self.rnng.output(hs.transpose(1, 0).contiguous())  # (batch_size, action_len, input_size)
     return hs
@@ -833,7 +823,8 @@ class FixedStackRNNG(nn.Module):
         bucket_i += 1
 
       self.finalize_word_completed_beam(
-        x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, word_beam_size)
+        x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
+        word_completed_beam, word_beam_size)
 
       marginal = beam.marginal_probs()
       for b, s in enumerate(marginal.cpu().detach().numpy()):
@@ -869,7 +860,7 @@ class FixedStackRNNG(nn.Module):
     beam.gen_ll[new_beam_idxs] = successors[2]
     actions = successors[1].new_full((x.size(0), beam_size), self.action_dict.padding_idx)
     actions[new_beam_idxs] = successors[1]
-    self.rnng(word_vecs, actions, beam.stack)
+    self.rnng(word_vecs, actions, beam.stack, subword_end_mask)
     beam.do_action(actions, self.action_dict)
 
     return added_forced_completions
@@ -899,11 +890,12 @@ class FixedStackRNNG(nn.Module):
                                      self.action_dict.padding_idx)
     actions[new_beam_idxs] = successors[1]
 
-    self.rnng(word_vecs, actions, beam.stack)
+    self.rnng(word_vecs, actions, beam.stack, subword_end_mask)
     beam.do_action(actions, self.action_dict)
 
   def finalize_word_completed_beam(
-      self, x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, word_beam_size):
+      self, x, subword_end_mask, sent_lengths, word_vecs, pointer, beam,
+      word_completed_beam, word_beam_size):
     beam_size = word_completed_beam.beam_size
     word_completed_beam.shrink(word_beam_size)
     word_end_actions = x.new_full((x.size(0), beam_size), self.action_dict.padding_idx)
@@ -918,7 +910,7 @@ class FixedStackRNNG(nn.Module):
     word_end_actions[shift_beam_idx_mask] = self.action_dict.a2i['SHIFT']
     word_end_actions[finish_beam_idx_mask] = self.action_dict.finish_action()
 
-    self.rnng(word_vecs, word_end_actions, word_completed_beam.stack)
+    self.rnng(word_vecs, word_end_actions, word_completed_beam.stack, subword_end_mask)
     word_completed_beam.do_action(word_end_actions, self.action_dict)
 
     beam.clear()
@@ -983,7 +975,7 @@ class FixedStackRNNG(nn.Module):
         bucket_i += 1
 
       self.finalize_particle_beam(
-        x, sent_lengths, word_vecs, pointer, beam, word_completed_beam, K,
+        x, subword_end_mask, sent_lengths, word_vecs, pointer, beam, word_completed_beam, K,
         original_reweight=original_reweight)
 
       marginal = beam.marginal_probs()
@@ -1075,8 +1067,8 @@ class FixedStackRNNG(nn.Module):
     return (mask_to_successors(no_end_action_mask),
             mask_to_successors(end_action_mask))
 
-  def finalize_particle_beam(self, x, sent_lengths, word_vecs, pointer, beam, word_completed_beam,
-                             K, original_reweight=False):
+  def finalize_particle_beam(self, x, subword_end_mask, sent_lengths, word_vecs, pointer,
+                             beam, word_completed_beam, K, original_reweight=False):
     # Filtered elements are moved to beam from word_completed_beam
     # (but no action performed yet)
     self.reweight_and_filter_particles(beam, word_completed_beam, K, original_reweight)
@@ -1088,7 +1080,7 @@ class FixedStackRNNG(nn.Module):
     finish_beam_idx_mask = (pointer == sent_lengths).unsqueeze(1) * active_idx_mask
     word_end_actions[shift_beam_idx_mask] = self.action_dict.a2i['SHIFT']
     word_end_actions[finish_beam_idx_mask] = self.action_dict.finish_action()
-    self.rnng(word_vecs, word_end_actions, beam.stack)
+    self.rnng(word_vecs, word_end_actions, beam.stack, subword_end_mask)
     beam.do_action(word_end_actions, self.action_dict)
 
   def reweight_and_filter_particles(
