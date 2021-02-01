@@ -4,6 +4,7 @@ import torch
 
 from fixed_stack_models import *
 from fixed_stack_in_order_models import *
+from subword_fixed_stack_in_order_models import *
 from action_dict import TopDownActionDict, InOrderActionDict
 
 class TestFixedStackModels(unittest.TestCase):
@@ -445,7 +446,7 @@ class TestFixedStackModels(unittest.TestCase):
         self.assertTensorAlmostEqual(word_completed_beam.beam_widths, torch.tensor([2, 1]))
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([2, 0]))
 
-        model.finalize_word_completed_beam(x, word_lengths, word_vecs, 0, beam, word_completed_beam, 2)
+        model.finalize_word_completed_beam(x, subword_end_mask, word_lengths, word_vecs, 0, beam, word_completed_beam, 2)
         self.assertTensorAlmostEqual(beam.beam_widths, torch.tensor([2, 1]))
         self.assertTensorAlmostEqual(
             beam.gen_ll[(torch.tensor([0, 0, 1]), torch.tensor([0, 1, 0]))],
@@ -510,7 +511,7 @@ class TestFixedStackModels(unittest.TestCase):
         beam.reconstruct(reconstruct_idx)
 
         def do_action(actions):
-            model.rnng(word_vecs, actions, beam.stack)
+            model.rnng(word_vecs, actions, beam.stack, subword_end_mask)
             beam.do_action(actions, model.action_dict)
 
         do_action(torch.tensor([[1, 1], [1, 1]]))  # (shift, shift); (shift, shift)
@@ -579,7 +580,7 @@ class TestFixedStackModels(unittest.TestCase):
 
     def test_in_order_beam_search(self):
         model = self._get_simple_in_order_model()
-        x = torch.tensor([[2, 3, 4], [1, 2, 5]])
+        x = torch.tensor([[1, 3, 4], [2, 2, 5]])
         subword_end_mask = x != 1
         parses, surprisals = model.word_sync_beam_search(x, subword_end_mask, 8, 5, 1)
         self.assertEqual(len(parses), 2)
@@ -633,6 +634,122 @@ class TestFixedStackModels(unittest.TestCase):
             self.assertEqual(len([a for a in parse if a == 1]), 5)  # 1 = shift
         for parse, score in parses[1]:
             self.assertEqual(len([a for a in parse if a == 1]), 3)
+
+    def test_subword_in_order_invalid_action_mask(self):
+        model = self._get_simple_in_order_model(num_nts=2)
+        model.max_open_nts = 2
+        model.max_cons_nts = 2
+        subword_end_mask = torch.tensor([[True, False, True], [False, True, True]])
+        x = torch.tensor([[2, 1, 3], [1, 2, 3]])  # 1 is an intermediate word
+        word_vecs = model.emb(x)
+        beam, word_completed_beam = model.build_beam_items(x, 2, 1)  # beam_size = 2
+        sent_len = torch.tensor([3, 3])
+
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(  # (2, 2, 5); only shift is allowed.
+            [[[1, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1]],  # beam idx 1 does not exist.
+             [[1, 0, 1, 1, 1, 1],
+              [1, 1, 1, 1, 1, 1]]]))
+
+        reconstruct_idx = (torch.tensor([0, 0, 1, 1]), torch.tensor([0, 0, 0, 0]))
+        beam.reconstruct(reconstruct_idx)
+
+        def do_action(actions):
+            model.rnng(word_vecs, actions, beam.stack, subword_end_mask)
+            beam.do_action(actions, model.action_dict)
+
+        do_action(torch.tensor([[1, 1], [1, 1]]))  # (shift, shift); (shift, shift)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 1, 1, 0, 0],
+              [1, 1, 1, 1, 0, 0]],
+             [[1, 0, 1, 1, 1, 1],
+              [1, 0, 1, 1, 1, 1]]]))
+
+        do_action(torch.tensor([[4, 4], [1, 1]]))  # (S, S); (shift, shift)
+
+        # Test the behavior of new do_nt.
+        self.assertTensorAlmostEqual(beam.stack.nt_index_pos[0], torch.tensor([0, 0]))
+        self.assertTensorAlmostEqual(beam.stack.nt_index[0,:,0], torch.tensor([1, 1]))
+        # Test that swap is correctly done.
+        self.assertTensorAlmostEqual(beam.stack.trees[0,0,1], word_vecs[0,0])
+        self.assertTensorAlmostEqual(beam.stack.trees[0,0,0],
+                                     model.rnng.nt_emb(torch.tensor([0]))[0])
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 0, 0, 1, 1, 1],  # (S w_
+              [1, 0, 0, 1, 1, 1]],  # (S w_
+             [[1, 1, 1, 1, 0, 0],  # w w_
+              [1, 1, 1, 1, 0, 0]]]))  # w w_
+
+        do_action(torch.tensor([[2, 1], [4, 4]]))  # (r, shift); (S, S)
+
+        # Test that swap is correctly done.
+        self.assertTensorAlmostEqual(beam.stack.nt_index_pos[1], torch.tensor([0, 0]))
+        self.assertTensorAlmostEqual(beam.stack.nt_index[1,:,0], torch.tensor([1, 1]))
+        self.assertTensorAlmostEqual(beam.stack.trees[1,0,1:3], word_vecs[1,:2])
+        self.assertTensorAlmostEqual(beam.stack.trees[1,0,0],
+                                     model.rnng.nt_emb(torch.tensor([0]))[0])
+
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 1, 1, 0, 0],  # (S w_)
+              [1, 0, 1, 1, 1, 1]],  # (S w_ w  no_end_word->shift_only
+             [[1, 0, 0, 1, 1, 1],  # (S w w_
+              [1, 0, 0, 1, 1, 1]]]))  # (S w w_
+
+        do_action(torch.tensor([[4, 1], [1, 2]]))  # (S, shift); (shift, r)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 0, 1, 1, 1, 1],  # (S (S w_)  ncons_nt=2 -> no more reduce
+              [1, 1, 0, 1, 0, 0]],  # (S w_ w w_
+             [[1, 1, 0, 1, 0, 0],  # (S w w_ w_
+              [1, 1, 1, 1, 0, 0]]]))  # (S w w_)
+
+        do_action(torch.tensor([[1, 2], [5, 5]]))  # (shift, r); (NP, NP)
+
+        # Test that swap is correctly done.
+        self.assertTensorAlmostEqual(beam.stack.nt_index_pos[1], torch.tensor([1, 0]))
+        self.assertEqual(beam.stack.nt_index[1,0,0], 1)
+        self.assertEqual(beam.stack.nt_index[1,0,1], 4)
+        self.assertEqual(beam.stack.nt_index[1,1,0], 1)
+        self.assertTensorAlmostEqual(beam.stack.trees[1,0,4], word_vecs[1,2])
+        self.assertTensorAlmostEqual(beam.stack.trees[1,0,3],
+                                     model.rnng.nt_emb(torch.tensor([1]))[0])
+        self.assertTensorAlmostEqual(beam.stack.trees[1,1,0],
+                                     model.rnng.nt_emb(torch.tensor([1]))[0])
+
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 0, 1, 1, 1, 1],  # (S (S w_) w
+              [1, 1, 1, 0, 0, 0]],  # (S w_ w w_)
+             [[1, 1, 0, 1, 1, 1],  # (S w w_ (NP w_
+              [1, 0, 1, 1, 1, 1]]]))  # (NP (S w w_)  ncons_nt=2 -> no more reduce
+
+        self.assertEqual(beam.stack.last_subword_begin_idx[0,0], 3)
+
+        do_action(torch.tensor([[1, 3], [2, 1]]))  # (shift, finish); (r, shift)
+        mask = model.invalid_action_mask(beam, sent_len, subword_end_mask)
+        self.assertTensorAlmostEqual(mask, torch.tensor(
+            [[[1, 1, 0, 1, 0, 0],  # (S (S w_) w w_
+              [1, 1, 1, 1, 1, 1]],  # -
+             [[1, 1, 0, 1, 0, 0],  # (S w w_ (NP w_)
+              [1, 1, 0, 1, 0, 0]]]))  # (NP (S w w_) w_
+
+        self.assertEqual(beam.stack.last_subword_begin_idx[0,0], 3)
+
+        do_action(torch.tensor([[5, 0], [4, 2]]))  # (NT, -); (S, r)
+
+        # Test that swap is correctly done.
+        self.assertTensorAlmostEqual(beam.stack.nt_index_pos[0], torch.tensor([1, -1]))
+        self.assertEqual(beam.stack.nt_index[0,0,0], 1)  # *(S* (S w_) (NP w w_
+        self.assertEqual(beam.stack.nt_index[0,0,1], 3)  # (S (S w_) *(NP* w w_
+        self.assertTensorAlmostEqual(beam.stack.trees[0,0,3:5], word_vecs[0,1:])
+        self.assertTensorAlmostEqual(beam.stack.trees[0,0,2],
+                                     model.rnng.nt_emb(torch.tensor([1]))[0])
+
+    
 
     def _get_simple_top_down_model(self, vocab=6, w_dim=4, h_dim=6, num_layers=2, num_nts=2):
         nts = ['S', 'NP', 'VP', 'X3', 'X4', 'X5', 'X6'][:num_nts]

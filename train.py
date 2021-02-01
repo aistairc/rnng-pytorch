@@ -273,8 +273,10 @@ def main(args):
                   ))
       return ppl, word_ppl, action_ppl
 
-    def calc_loss(token_ids, action_ids):
-      loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
+    def calc_loss(token_ids, action_ids, max_stack_size, subword_end_mask):
+      loss, a_loss, w_loss, _ = model(token_ids, action_ids,
+                                      stack_size_bound=max_stack_size,
+                                      subword_end_mask=subword_end_mask)
       if args.loss_normalize == 'sum':
         loss = loss
       elif args.loss_normalize == 'batch':
@@ -285,7 +287,7 @@ def main(args):
         loss = loss / w_loss.size(0)
       return loss, a_loss, w_loss
 
-    def batch_step(token_ids, action_ids, num_divides):
+    def batch_step(token_ids, action_ids, max_stack_size, subword_end_mask, num_divides):
       optimizer.zero_grad()
       block_size = token_ids.size(0) // num_divides
       total_a_loss = 0
@@ -295,7 +297,9 @@ def main(args):
       for begin_idx in range(0, token_ids.size(0), block_size):
         div_token_ids = token_ids[begin_idx:begin_idx+block_size]
         div_action_ids = action_ids[begin_idx:begin_idx+block_size]
-        loss, a_loss, w_loss = calc_loss(div_token_ids, div_action_ids)
+        div_subword_end_mask = subword_end_mask[begin_idx:begin_idx+block_size]
+        loss, a_loss, w_loss = calc_loss(div_token_ids, div_action_ids,
+                                         max_stack_size, div_subword_end_mask)
         if num_divides > 1:
           loss  = loss / num_divides
         if args.amp:
@@ -308,9 +312,10 @@ def main(args):
         num_ws += w_loss.size(0)
       return total_a_loss, total_w_loss, num_as, num_ws
 
-    def try_batch_step(token_ids, action_ids, num_divides = 1):
+    def try_batch_step(token_ids, action_ids, max_stack_size, subword_end_mask,
+                       num_divides = 1):
       try:
-        return batch_step(token_ids, action_ids, num_divides)
+        return batch_step(token_ids, action_ids, max_stack_size, subword_end_mask, num_divides)
       except RuntimeError as e:  # memory error -> retry by reducing batch size
         # Error is processed outside this scope.
         # A hack to prevent memory leak when handling oov.
@@ -323,17 +328,19 @@ def main(args):
         token_ids.size(), action_ids.size()
       ))
       logger.warning('Retry by halfing batch sizes...')
-      return try_batch_step(token_ids, action_ids, num_divides * 2)
+      return try_batch_step(token_ids, action_ids, max_stack_size, subword_end_mask,
+                            num_divides * 2)
 
     for batch in train_data.batches():
-      token_ids, action_ids, max_stack_size, batch_idx = batch
+      token_ids, action_ids, max_stack_size, subword_end_mask, batch_idx = batch
       token_ids = token_ids.to(device)
       action_ids = action_ids.to(device)
+      subword_end_mask = subword_end_mask.to(device)
       b += 1
       global_batch_i += 1
       # optimizer.zero_grad()
 
-      batch_ll = try_batch_step(token_ids, action_ids)
+      batch_ll = try_batch_step(token_ids, action_ids, max_stack_size, subword_end_mask)
       total_a_ll += batch_ll[0]
       total_w_ll += batch_ll[1]
 
@@ -421,10 +428,13 @@ def eval_action_ppl(data, model):
   total_w_ll = 0
   with torch.no_grad():
     for batch in data.batches():
-      token_ids, action_ids, max_stack_size, batch_idx = batch
+      token_ids, action_ids, max_stack_size, subword_end_mask, batch_idx = batch
       token_ids = token_ids.to(device)
       action_ids = action_ids.to(device)
-      loss, a_loss, w_loss, _ = model(token_ids, action_ids, stack_size_bound=max_stack_size)
+      subword_end_mask = subword_end_mask.to(device)
+      loss, a_loss, w_loss, _ = model(token_ids, action_ids,
+                                      stack_size_bound=max_stack_size,
+                                      subword_end_mask=subword_end_mask)
       total_a_ll += -a_loss.sum().detach().item()
       total_w_ll += -w_loss.sum().detach().item()
 

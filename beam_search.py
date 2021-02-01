@@ -54,6 +54,8 @@ parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'],
                     help='If "cuda", GPU number --gpu is used.')
 parser.add_argument('--seed', default=3435, type=int)
 parser.add_argument('--fp16', action='store_true')
+parser.add_argument('--max_length_diff', default=20, type=int,
+                    help='Maximum sentence length difference in a single batch does not exceed this.')
 
 def load_model(checkpoint, action_dict, vocab):
   if 'model_state_dict' in checkpoint:
@@ -83,7 +85,10 @@ def main(args):
 
   # todo: add tagger.
   dataset = Dataset.from_text_file(args.test_file, args.batch_size, vocab, action_dict,
-                                   prepro_args = prepro_args, batch_token_size = args.batch_token_size)
+                                   prepro_args = prepro_args,
+                                   batch_token_size = args.batch_token_size,
+                                   batch_group = 'similar_length'
+  )
   logger.info("model architecture")
   logger.info(model)
   model.eval()
@@ -151,12 +156,14 @@ def main(args):
     block_idxs = []
     block_parses = []
     block_surprisals = []  # This is subword-based surprisal in general. Conversion to word-level surprisal is done at output phase.
-    batches = [batch for batch in dataset.test_batches(args.block_size)]
+    batches = [batch for batch in dataset.test_batches(
+      args.block_size, max_length_diff=args.max_length_diff)]
 
     for batch in tqdm(batches):
       tokens, subword_end_mask, batch_idx = batch
       tokens = tokens.to(device)
       subword_end_mask = subword_end_mask.to(device)
+
       parses, surprisals, beam_history = try_parse( tokens, subword_end_mask)
       if any(len(p) == 0 for p in parses):
         # parse failure (on some tree in a batch)

@@ -6,7 +6,7 @@ import torch
 import pickle
 from collections import defaultdict
 import json
-from utils import pad_items, clean_number, berkeley_unk_conv, berkeley_unk_conv2
+from utils import pad_items, clean_number, berkeley_unk_conv, berkeley_unk_conv2, get_subword_boundary_mask
 from action_dict import TopDownActionDict, InOrderActionDict
 
 class Vocabulary(object):
@@ -61,6 +61,10 @@ class Vocabulary(object):
   def get_id(self, w):
     if w not in self.w2i:
       w = self.to_unk(w)
+      if w not in self.w2i:
+        # Back-off to a general unk token when converted unk-token is not registered in the
+        # vocabulary (which happens when an unseen unk token is generated at test time).
+        w = self.unktoken
     return self.w2i[w]
 
   def get_count_from_id(self, w_id):
@@ -147,7 +151,7 @@ class SentencePieceVocabulary(object):
 class Sentence(object):
   def __init__(self, orig_tokens, tokens, token_ids, tags,
                actions=None, action_ids=None, tree_str=None,
-               max_stack_size=-1):
+               max_stack_size=-1, is_subword_end=None):
     self.orig_tokens = orig_tokens
     self.tokens = tokens
     self.token_ids = token_ids
@@ -156,6 +160,13 @@ class Sentence(object):
     self.action_ids = action_ids or []
     self.tree_str = tree_str  # original annotation
     self.max_stack_size = max_stack_size
+
+    if is_subword_end is not None:
+      assert isinstance(is_subword_end, list)
+    else:
+      assert self.tokens is not None
+      is_subword_end = get_subword_boundary_mask(self.tokens)
+    self.is_subword_end = is_subword_end
 
   @staticmethod
   def from_json(j, oracle='top_down'):
@@ -172,7 +183,8 @@ class Sentence(object):
                     actions,
                     action_ids,
                     j.get('tree_str', None),
-                    j.get('max_stack_size', -1))
+                    j.get('max_stack_size', -1),
+                    j.get('is_subword_end', None))
 
   def random_unked(self, vocab):
     def unkify_rand(w_id):
@@ -183,22 +195,21 @@ class Sentence(object):
         return w_id
     return [unkify_rand(i) for i in self.token_ids]
 
-  def get_word_end_mask(self):
-    if any('▁' in t for t in self.tokens):
-      # subword-tokenized
-      return ['▁' in t for t in self.tokens]
-    else:
-      return [True for t in self.tokens]
+  # def get_word_end_mask(self):
+  #   if any('▁' in t for t in self.tokens):
+  #     # subword-tokenized
+  #     return ['▁' in t for t in self.tokens]
+  #   else:
+  #     return [True for t in self.tokens]
 
   def get_subword_span_index(self):
     """
     Given tokens = ["In▁", "an▁", "Oct", ".▁", "19▁"],
     return [[0], [1], [2, 3], [4]].
     """
-    word_end_mask = self.get_word_end_mask()
     idxs = []
     cur_word_idx = []
-    for i, is_end in enumerate(word_end_mask):
+    for i, is_end in enumerate(self.is_subword_end):
       cur_word_idx.append(i)
       if is_end:
         idxs.append(cur_word_idx)
@@ -275,8 +286,9 @@ class Dataset(object):
         o = json.loads(line)
         k = o['key']
         if k == 'sentence':
+          o['is_subword_end'] = get_subword_boundary_mask(o['tokens'])
           # Unused values are discarded here (for reducing memory for larger data).
-          o['tree_str'] = o['tokens'] = o['actions'] = o['in_order_actions'] = o['tags'] = None
+          o['tokens'] = o['orig_tokens'] = o['tree_str'] = o['actions'] = o['in_order_actions'] = o['tags'] = None
           sents.append(o)
         else:
           # key except 'sentence' should only appear once
@@ -333,7 +345,7 @@ class Dataset(object):
   def batches(self, shuffle=True):
     yield from self.batches_helper(self.len_to_idxs, shuffle)
 
-  def test_batches(self, block_size = 1000):
+  def test_batches(self, block_size = 1000, max_length_diff=20):
     assert block_size > 0
     """
     Sents are first segmented (chunked) by block_size, and then, mini-batched.
@@ -363,13 +375,8 @@ class Dataset(object):
     """
     for offset in range(0, len(self.sents), block_size):
       end = min(len(self.sents), offset + block_size)
-      len_to_idxs = self._get_grouped_len_to_idxs(range(offset, end))
-      for tokens, batch_idx in self.batches_helper(len_to_idxs, False, True):
-        if self.use_subwords:
-          subword_end_mask = self.get_subword_end_mask(batch_idx)
-        else:
-          subword_end_mask = torch.full(tokens.size(), 1, dtype=torch.bool)
-        yield tokens, subword_end_mask, batch_idx
+      len_to_idxs = self._get_grouped_len_to_idxs(range(offset, end), max_length_diff=max_length_diff)
+      yield from self.batches_helper(self.len_to_idxs, False, True)
 
   def batches_helper(self, len_to_idxs, shuffle=True, test=False):
     # `len_to_idxs` summarizes sentence length to idx in `self.sents`.
@@ -429,18 +436,23 @@ class Dataset(object):
 
     for batch_idx in batches:
       token_ids = [conv_sent(i) for i in batch_idx]
-      ret = (torch.tensor(self._pad_token_ids(token_ids), dtype=torch.long),)
+      tokens = torch.tensor(self._pad_token_ids(token_ids), dtype=torch.long)
+      ret = (tokens,)
       if not test:
         action_ids = [self.sents[i].action_ids for i in batch_idx]
         max_stack_size = max([self.sents[i].max_stack_size for i in batch_idx])
         ret += (torch.tensor(self._pad_action_ids(action_ids), dtype=torch.long),
                 max_stack_size)
-      ret += (batch_idx,)
+      if self.use_subwords:
+        subword_end_mask = self.get_subword_end_mask(batch_idx)
+      else:
+        subword_end_mask = torch.full(tokens.size(), 1, dtype=torch.bool)
+      ret += (subword_end_mask, batch_idx,)
       yield ret
 
   def get_subword_end_mask(self, sent_idxs):
-    is_token_end = [self.sents[i].get_word_end_mask() for i in sent_idxs]
-    return torch.tensor(pad_items(is_token_end, 0)[0], dtype=torch.bool)
+    is_subword_ends = [self.sents[i].is_subword_end for i in sent_idxs]
+    return torch.tensor(pad_items(is_subword_ends, 0)[0], dtype=torch.bool)
 
   def _get_len_to_idxs(self, sent_idxs = []):
     def to_len(token_ids):
