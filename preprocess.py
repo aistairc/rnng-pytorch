@@ -267,27 +267,35 @@ def get_data(args):
     def convert(textfile, lowercase, replace_num, seqlength, minseqlength,
                 outfile, vocab, sp, action_dict, io_action_dict, apply_length_filter=True, jobs=-1):
         dropped = 0
-        sentences = []
+        num_sents = 0
         conv_setting = (lowercase, replace_num, vocab, sp, action_dict, io_action_dict)
-        with open(textfile, 'r') as f:
-            tree_with_settings = [(tree, conv_setting) for tree in f]
-        with Pool(jobs) as pool:
-            for sent_info in pool.map(get_sent_info, tree_with_settings):
-                tokens = sent_info['tokens']
-                if apply_length_filter and (len(tokens) > seqlength or len(tokens) < minseqlength):
-                    dropped += 1
-                    continue
-                sentences.append(sent_info)
+        def process_block(tree_with_settings, f):
+            _dropped = 0
+            with Pool(jobs) as pool:
+                for sent_info in pool.map(get_sent_info, tree_with_settings):
+                    tokens = sent_info['tokens']
+                    if (apply_length_filter and
+                        (len(tokens) > seqlength or len(tokens) < minseqlength)):
+                        _dropped += 1
+                        continue
+                    sent_info['key'] = 'sentence'
+                    f.write(json.dumps(sent_info)+'\n')
+            return _dropped
 
-        print(len(sentences))
+        with open(outfile, 'wt') as f, open(textfile, 'r') as in_f:
+            block_size = 100000
+            tree_with_settings = []
+            for tree in in_f:
+                tree_with_settings.append((tree, conv_setting))
+                if len(tree_with_settings) >= block_size:
+                    dropped += process_block(tree_with_settings, f)
+                    num_sents += len(tree_with_settings)
+                    tree_with_settings = []
+                    print(num_sents)
+            if len(tree_with_settings) > 0:
+                process_block(tree_with_settings, f)
+                num_sents += len(tree_with_settings)
 
-        print("Saved {} sentences (dropped {} due to length/unk filter)".format(
-            len(sentences), dropped))
-
-        with open(outfile, 'wt') as f:
-            for sent in sentences:
-                sent['key'] = 'sentence'
-                f.write(json.dumps(sent)+'\n')
             others = {"vocab": vocab.to_json_dict() if vocab is not None else None,
                       "nonterminals": nonterminals,
                       "pad_token": pad,
@@ -296,8 +304,11 @@ def get_data(args):
             for k, v in others.items():
                 f.write(json.dumps({'key': k, 'value': v})+'\n')
 
+        print("Saved {} sentences (dropped {} due to length/unk filter)".format(
+            num_sents, dropped))
+
     print("First pass through data to get nonterminals...")
-    nonterminals = get_nonterminals([args.trainfile, args.valfile], args.jobs)
+    nonterminals = get_nonterminals([args.trainfile, args.valfile, args.testfile], args.jobs)
     action_dict = TopDownActionDict(nonterminals)
     io_action_dict = InOrderActionDict(nonterminals)
 

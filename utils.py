@@ -362,3 +362,9 @@ def berkeley_unk_conv2(token):
       result = result + '-al'
   return result
 
+def get_subword_boundary_mask(tokens):
+  if any('▁' in t for t in tokens):
+    # subword-tokenized
+    return ['▁' in t for t in tokens]
+  else:
+    return [True for t in tokens]
