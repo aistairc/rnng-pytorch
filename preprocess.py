@@ -13,7 +13,9 @@ import itertools
 from collections import defaultdict
 import utils
 import re
+import shutil
 import json
+from pathlib import Path
 from tempfile import NamedTemporaryFile
 from multiprocessing import Pool
 import itertools
@@ -313,8 +315,16 @@ def get_data(args):
     io_action_dict = InOrderActionDict(nonterminals)
 
     if args.unkmethod == 'subword':
-        print('unkmethod subword is selected. Running sentencepiece on the training data...')
-        sp = learn_sentencepiece(args.trainfile, args.outputfile+'-spm', args)
+        if args.vocabfile != '':
+            print('Loading pre-trained sentencepiece model from {}'.format(args.vocabfile))
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor(model_file=args.vocabfile)
+            sp_model_path = '{}-spm.model'.format(args.outputfile)
+            print('Copy sentencepiece model to {}'.format(sp_model_path))
+            shutil.copyfile(args.vocabfile, sp_model_path)
+        else:
+            print('unkmethod subword is selected. Running sentencepiece on the training data...')
+            sp = learn_sentencepiece(args.trainfile, args.outputfile+'-spm', args)
         vocab = None
     else:
         if args.vocabfile != '':
@@ -376,7 +386,8 @@ def main(arguments):
                         required=True)
     parser.add_argument('--vocabfile', help="If working with a preset vocab, "
                                             "then including this will ignore srcvocabsize and use the"
-                                            "vocab provided here.",
+                                            "vocab provided here. "
+                                            "If unkmethod=subword, this argument specifies learned sentencepiece model.",
                                             type = str, default='')
     parser.add_argument('--jobs', type=int, default=-1)
     args = parser.parse_args(arguments)
