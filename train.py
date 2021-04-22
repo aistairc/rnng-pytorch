@@ -254,6 +254,7 @@ def main(args):
     total_a_ll = 0.
     total_w_ll = 0.
     prev_ll = 0.
+    batch_sizes = []
 
     def output_learn_log():
       param_norm = sum([p.norm()**2 for p in model.parameters()]).item()**0.5
@@ -265,11 +266,13 @@ def main(args):
       logger.info('Epoch: {}, Batch: {}/{}, LR: {:.4f}, '
                   'ActionPPL: {:.2f}, WordPPL: {:.2f}, '
                   'PPL: {:2f}, LL: {}, '
-                  '|Param|: {:.2f}, Throughput: {:.2f} examples/sec'.format(
+                  '|Param|: {:.2f}, E[batch size]: {}, Throughput: {:.2f} examples/sec'.format(
                     epoch, b, len(train_data), optimizer.param_groups[0]['lr'],
                     action_ppl, word_ppl,
                     ppl, -ll_diff,
-                    param_norm, num_sents / (time.time() - start_time)
+                    param_norm,
+                    sum(batch_sizes) / len(batch_sizes),
+                    num_sents / (time.time() - start_time)
                   ))
       return ppl, word_ppl, action_ppl
 
@@ -333,6 +336,7 @@ def main(args):
 
     for batch in train_data.batches():
       token_ids, action_ids, max_stack_size, subword_end_mask, batch_idx = batch
+      batch_sizes.append(token_ids.size(0))
       token_ids = token_ids.to(device)
       action_ids = action_ids.to(device)
       subword_end_mask = subword_end_mask.to(device)
