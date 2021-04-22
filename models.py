@@ -208,7 +208,7 @@ class TopDownRNNG(nn.Module):
 
     self.initial_emb = nn.Sequential(nn.Embedding(1, w_dim), self.dropout)
 
-  def forward(self, x, actions, initial_stack = None):
+  def forward(self, x, actions, initial_stack = None, stack_size_bound = -1, subword_end_mask = None):
     assert isinstance(x, torch.Tensor)
     assert isinstance(actions, torch.Tensor)
 
@@ -260,6 +260,7 @@ class TopDownRNNG(nn.Module):
     hiddens = hiddens[idx]
 
     x = x.view(-1)
+    x = x[x != self.padding_idx]
     assert x.size(0) == hiddens.size(0)
     logit = self.vocab_mlp(hiddens)
     loss = self.word_criterion(logit, x)
