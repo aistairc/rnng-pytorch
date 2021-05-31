@@ -1,24 +1,33 @@
-# PyTorch-based Fully Tensorized Recurrent Neural Network Grammars (RNNGs)
+# Fully Tensorized Recurrent Neural Network Grammars (RNNGs) based on PyTorch
+
+This repository provides code for training and testing fully tensorized (batched) recurrent neural network grammars. The code is 100% PyTorch and every operation is batched. Both training and inference are significantly faster than existing DyNet-based RNNG implementation. The technical detail is found in the following paper:
+
+> [Effective Batching for Recurrent Neural Network Grammars]() <br>
+> Hiroshi Noji and Yohei Oseki <br>
+> Findings of ACL - ACL-IJCNLP 2021 <br>
 
 ## Dependencies
-Most of the code should work with PyTorch 1.5 or above. However, if you use mixed-precision training (with `--amp` option), you need to install nightly-version of PyTorch (`pytorch-nightly`), which resolved some tricly bugs around AMP with version `1.6`.
+- PyTorch 1.7 or above.
 
 ## Data
 We first convert a PTB-style dataset (examples found in `data/` folder) into a single json file by preprocessing, which converts each parse tree into tokens, ids (after unkifying), oracle actions, etc:
 ```
-$ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt 
+$ python preprocess.py --trainfile data/train.txt --valfile data/valid.txt --testfile data/test.txt
 --outputfile data/ptb --vocabminfreq 2 --unkmethod berkeleyrule
 ```
 By `--unkmethod berkeleyrule`, an unknown token is convert to a special symbol that exploits some surface features, such as `<unk-ly>`, which indicates an unknown token ending with `ly` suffix (e.g., nominally).
 
 The outputs are `data/ptb-train.json`, `data/ptb-val.json`, and `data/ptb-test.json`. Vocabulary is defined by tokens in the training data. Which tokens to include in the vocabulary is decided by `--vocabminfreq` or `--vocabsize` argument (see `python preprocess.py --help`).
 
+For using subwords, see the help with `--help`.
+This needs `sentencepiece` to be installed.
+
 ## Training
 The current implementation is hard-coded for running on a single GPU.
 
 Example to train a model:
 ```
-$ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json --save_path rnng.pt
+$ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json --save_path rnng.pt --batch_size 512
 --fixed_stack --strategy top_down --dropout 0.3 --optimizer adam --lr 0.001 --gpu 0
 ```
 
@@ -26,7 +35,7 @@ $ python train.py --train_file data/ptb-train.json --val_file data/ptb-val.json 
 
 - I recomment to use `adam` optimizer instead of `sgd`. Although the original paper reports the results with SGD, I found that Adam works much more stable for this implementation.
 - `--lr` and `--dropout` have a large impact on the performance and should be tuned on each dataset.
-- Training becomes faster by a larger batch size (e.g., `--batch_size 128`) but the impact to the final performance is not fully investigated. For modest amount of data (e.g., English PTB, ~1M tokens), `--batch_size 64` seems to work well.
+- Even on smaller dataset, such as Penn Treebank, I found that large batch size works better.
 - `--fixed_stack` is always recommended. Without this, the training will be done by the older code that is not fully tensorized and thus slow.
 
 ### Parsing strategies
@@ -57,3 +66,11 @@ Alternately, you can search with particle filtering rather than fixed size beam 
 $ python beam_search.py --test_file valid.tokens --model_file rnng.pt --batch_size 20 --particle_filter
 --particle_size 1000 --gpu 0 --lm_output_file surprisals.txt > valid.parsed
 ```
+
+## Credits
+
+This repository is originally based on the [Unsupervised Recurrent Neural Network Grammars](https://github.com/harvardnlp/urnng) by Yoon Kim, Alexander Rush, Lei Yu, Adhiguna Kuncoro, Chris Dyer, and Gabor Melis.
+
+## License
+
+MIT
